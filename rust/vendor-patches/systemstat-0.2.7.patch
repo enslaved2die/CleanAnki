@@ -1,0 +1,124 @@
+diff -ruN --ex a/systemstat/src/data.rs b/systemstat/src/data.rs
+--- a/systemstat/src/data.rs	2026-07-10 23:55:49
++++ b/systemstat/src/data.rs	2026-07-10 23:55:50
+@@ -308,7 +308,8 @@
+     pub uncompressed_in_compressor: ByteSize,
+ }
+ 
+-#[cfg(any(target_os = "linux", target_os = "android", target_os = "hurd"))]
++// WASM SPIKE: emscripten added so a linux-style PlatformMemory type exists.
++#[cfg(any(target_os = "linux", target_os = "android", target_os = "hurd", target_os = "emscripten"))]
+ #[cfg_attr(
+     feature = "serde",
+     derive(Serialize, Deserialize),
+@@ -340,6 +341,7 @@
+     target_os = "illumos",
+     target_os = "solaris",
+     target_os = "hurd",
++    target_os = "emscripten",
+ ))]
+ pub type PlatformSwap = PlatformMemory;
+ 
+diff -ruN --ex a/systemstat/src/platform/emscripten.rs b/systemstat/src/platform/emscripten.rs
+--- a/systemstat/src/platform/emscripten.rs	1970-01-01 01:00:00
++++ b/systemstat/src/platform/emscripten.rs	2026-07-10 23:55:50
+@@ -0,0 +1,83 @@
++//! WASM SPIKE (CleanAnki) stub platform for `wasm32-unknown-emscripten`.
++//!
++//! Emscripten has no host system-metrics backend, and systemstat 0.2.7 ships no
++//! implementation for `target_os = "emscripten"` (only unix/windows variants),
++//! so `PlatformImpl` is otherwise undefined and the crate fails to compile.
++//!
++//! systemstat is pulled in transitively only by `burn-train` (via `fsrs`), which
++//! the wasm bridge never exercises at runtime, so every query simply returns an
++//! "unsupported" error. This exists purely so the crate compiles + links.
++
++use std::collections::BTreeMap;
++use std::io;
++
++use crate::data::*;
++use crate::platform::common::Platform;
++
++fn unsupported<T>() -> io::Result<T> {
++    Err(io::Error::new(
++        io::ErrorKind::Unsupported,
++        "systemstat: unsupported on wasm32-unknown-emscripten",
++    ))
++}
++
++pub struct PlatformImpl;
++
++impl Platform for PlatformImpl {
++    fn new() -> Self {
++        PlatformImpl
++    }
++
++    fn cpu_load(&self) -> io::Result<DelayedMeasurement<Vec<CPULoad>>> {
++        unsupported()
++    }
++
++    fn load_average(&self) -> io::Result<LoadAverage> {
++        unsupported()
++    }
++
++    fn memory(&self) -> io::Result<Memory> {
++        unsupported()
++    }
++
++    fn swap(&self) -> io::Result<Swap> {
++        unsupported()
++    }
++
++    // The trait requires overriding one of `uptime`/`boot_time`.
++    fn uptime(&self) -> io::Result<Duration> {
++        unsupported()
++    }
++
++    fn battery_life(&self) -> io::Result<BatteryLife> {
++        unsupported()
++    }
++
++    fn on_ac_power(&self) -> io::Result<bool> {
++        unsupported()
++    }
++
++    fn mounts(&self) -> io::Result<Vec<Filesystem>> {
++        unsupported()
++    }
++
++    fn block_device_statistics(&self) -> io::Result<BTreeMap<String, BlockDeviceStats>> {
++        unsupported()
++    }
++
++    fn networks(&self) -> io::Result<BTreeMap<String, Network>> {
++        unsupported()
++    }
++
++    fn network_stats(&self, _interface: &str) -> io::Result<NetworkStats> {
++        unsupported()
++    }
++
++    fn cpu_temp(&self) -> io::Result<f32> {
++        unsupported()
++    }
++
++    fn socket_stats(&self) -> io::Result<SocketStats> {
++        unsupported()
++    }
++}
+diff -ruN --ex a/systemstat/src/platform/mod.rs b/systemstat/src/platform/mod.rs
+--- a/systemstat/src/platform/mod.rs	2026-07-10 23:55:49
++++ b/systemstat/src/platform/mod.rs	2026-07-10 23:55:50
+@@ -2,6 +2,12 @@
+ pub mod common;
+ pub use self::common::*;
+ 
++// WASM SPIKE (CleanAnki): emscripten stub, see emscripten.rs.
++#[cfg(target_os = "emscripten")]
++pub mod emscripten;
++#[cfg(target_os = "emscripten")]
++pub use self::emscripten::PlatformImpl;
++
+ #[cfg(windows)]
+ pub mod windows;
+ #[cfg(windows)]

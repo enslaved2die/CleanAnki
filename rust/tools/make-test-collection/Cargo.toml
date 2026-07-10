@@ -1,0 +1,10 @@
+[package]
+name = "make-test-collection"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Host-native helper: produces a fresh, valid empty .anki2 collection file for the wasm bridge's Node smoke test (see docs/ARCHITECTURE.md 2026-07-10 §7). Not part of the wasm build."
+
+[dependencies.anki]
+path = "../../vendor/anki/rslib"
+package = "anki"

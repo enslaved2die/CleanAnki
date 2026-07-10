@@ -1,0 +1,64 @@
+[package]
+name = "anki-wasm-bridge"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Phase 1 spike: expose a minimal slice of Anki's rslib backend to JS/WASM."
+
+[[bin]]
+# 2026-07-10: switched from a cdylib to a plain bin target. A cdylib on
+# wasm32-unknown-emscripten links as an Emscripten "side module" (needs a
+# paired main module + emscripten's dynamic-linking JS runtime to load — a lot
+# of extra machinery for no benefit here). A `bin` target with a trivial
+# `fn main() {}` is the well-trodden Emscripten path: emcc treats it as a
+# main-module executable and emits its own JS glue (a `.mjs`/`.js` loader)
+# alongside the `.wasm`, which is exactly what we want a JS host to load.
+# wasm-bindgen was dropped entirely (see below) in favour of plain
+# `#[no_mangle] pub extern "C"` exports, so there is no `[lib]` target at all
+# — everything lives directly in the bin crate root (src/main.rs) to avoid the
+# linker dropping unreferenced `#[no_mangle]` symbols from an rlib.
+name = "anki_wasm_bridge"
+path = "src/main.rs"
+
+[dependencies]
+# Already a transitive dependency of anki itself (cargo resolves this to the
+# same version, no duplicate compile) — used to JSON-encode wasm_list_decks'
+# result rather than hand-rolling JSON string escaping ourselves.
+serde_json = "1"
+
+# --- The real Anki backend --------------------------------------------------
+# The crate living in the `rslib/` directory is actually named `anki` (the dir
+# is "rslib", the [package] name is "anki"), so we must alias it via `package`.
+# Pinned to the most recent NON-beta release tag (26.05). Cargo fetches the
+# whole repo, so rslib's internal path-deps (anki_i18n, anki_io, anki_proto, ...)
+# resolve automatically.
+#
+# default-features = false is set for hygiene, but be aware: it does NOT trim the
+# heavy native deps. rslib's only cargo features are `bench`, `rustls` and
+# `native-tls`; rusqlite (bundled SQLite), tokio (rt-multi-thread), rayon, zstd
+# (zstdmt) and reqwest are all MANDATORY (non-optional) dependencies and cannot
+# be feature-gated away. See docs/ARCHITECTURE.md "Blockers".
+[dependencies.anki]
+# Local vendored + patched clone of anki @ tag 26.05 (see docs/ARCHITECTURE.md).
+# We patch rslib's Cargo.toml to make the networking/sync deps optional so that
+# reqwest/axum don't pull tokio's `net` feature (which drags in `mio`, whose
+# build hard-rejects wasm targets). `sync` feature intentionally left disabled.
+path = "../vendor/anki/rslib"
+package = "anki"
+default-features = false
+
+# WASM SPIKE: systemstat 0.2.7 (pulled transitively via fsrs -> burn -> burn-train)
+# has no `target_os = "emscripten"` platform impl and fails to compile. The vendored
+# copy adds an "unsupported"-returning stub. See docs/ARCHITECTURE.md (2026-07-10).
+[patch.crates-io]
+systemstat = { path = "../vendor/systemstat" }
+# burn-train (via fsrs training) uses async_channel blocking ops + a spawned
+# thread that don't exist on wasm; the vendored copy processes metrics
+# synchronously on wasm. See docs/ARCHITECTURE.md (2026-07-10).
+burn-train = { path = "../vendor/burn-train" }
+
+[profile.release]
+# Smaller wasm; emscripten still links its own runtime on top.
+opt-level = "z"
+lto = true
+panic = "abort"

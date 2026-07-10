@@ -1,0 +1,168 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 95d6ef4..104de90 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -456,9 +456,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "axum-client-ip"
+-version = "1.1.3"
++version = "1.3.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "3f08a543641554404b42acd0d2494df12ca2be034d7b8ee4dbbf7446f940a2ef"
++checksum = "a8ba1af5b620232acf37f2eb6d22151ea465491e0b4c25f552d1990f64ec5a67"
+ dependencies = [
+  "axum",
+  "client-ip",
+@@ -1105,9 +1105,9 @@ checksum = "b94f61472cee1439c0b966b47e3aca9ae07e45d070759512cd390ea2bebc6675"
+ 
+ [[package]]
+ name = "client-ip"
+-version = "0.1.1"
++version = "0.2.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "31211fc26899744f5b22521fdc971e5f3875991d8880537537470685a0e9552d"
++checksum = "39d2056bf065c8b4bce5a8898d40e175211ff4410add2a84d695845d3937c729"
+ dependencies = [
+  "http 1.3.1",
+ ]
+diff --git a/rslib/Cargo.toml b/rslib/Cargo.toml
+index eac2c14..4cb0dc6 100644
+--- a/rslib/Cargo.toml
++++ b/rslib/Cargo.toml
+@@ -10,9 +10,20 @@ workspace = ".."
+ description = "Anki's Rust library code"
+ 
+ [features]
++default = ["sync-server"]
+ bench = ["criterion"]
+ rustls = ["reqwest/rustls-tls", "reqwest/rustls-tls-native-roots"]
+ native-tls = ["reqwest/native-tls"]
++# WASM SPIKE (CleanAnki): gates the embedded sync HTTP *server* (the only code
++# using axum::serve + tokio::net::TcpListener + tokio::signal). Those pull
++# tokio's `net`/`signal` features, which drag in `mio`, whose build contains a
++# hard `compile_error!` on wasm targets. Disabling this feature (the wasm bridge
++# sets default-features=false) drops mio while KEEPING the reqwest-based sync
++# *client* and every shared sync data type (Graves, MediaDatabase, progress,
++# sanity counts, error variants) that core storage/media/progress depend on.
++# Native/desktop consumers keep it via `default`, so their behaviour is
++# unchanged. See docs/ARCHITECTURE.md (2026-07-10 section).
++sync-server = ["tokio/signal", "axum/tokio", "axum-client-ip/connect-info"]
+ 
+ [[bench]]
+ name = "benchmark"
+@@ -45,8 +56,14 @@ anki_io.workspace = true
+ anki_proto.workspace = true
+ async-compression.workspace = true
+ async-trait.workspace = true
+-axum.workspace = true
+-axum-client-ip.workspace = true
++# WASM SPIKE: overridden from workspace to drop the `tokio` default feature
++# (which enables tokio/net -> mio). Re-added under the `sync-server` feature.
++axum = { version = "0.8.4", default-features = false, features = ["multipart", "macros", "form", "http1", "json", "matched-path", "original-uri", "query", "tower-log", "tracing"] }
++# WASM SPIKE: overridden to drop `connect-info` (which enables axum/tokio ->
++# tokio/net -> mio). Re-added under the `sync-server` feature.
++# Bumped from workspace 1.1.3 -> 1.3.x: 1.1.3 pulls axum/tokio unconditionally,
++# whereas 1.3.x gates it behind the `connect-info` feature (re-added under sync-server).
++axum-client-ip = { version = "1.3", default-features = false, features = ["serde"] }
+ axum-extra.workspace = true
+ bitflags.workspace = true
+ blake3.workspace = true
+@@ -99,7 +116,10 @@ sha2.workspace = true
+ snafu.workspace = true
+ strum.workspace = true
+ tempfile.workspace = true
+-tokio.workspace = true
++# WASM SPIKE: overridden from workspace to drop the `signal` feature (Unix
++# signal machinery that pulls tokio/net -> mio and has no emscripten backend).
++# `signal` is only used by the embedded sync server; re-added under `sync-server`.
++tokio = { version = "1.45", features = ["fs", "rt-multi-thread", "macros", "io-util", "time", "sync"] }
+ tokio-util.workspace = true
+ tower-http.workspace = true
+ tracing.workspace = true
+diff --git a/rslib/src/backend/mod.rs b/rslib/src/backend/mod.rs
+index 1dbc57a..cf32205 100644
+--- a/rslib/src/backend/mod.rs
++++ b/rslib/src/backend/mod.rs
+@@ -177,7 +177,14 @@ impl Backend {
+         let mut web_client = self.web_client.lock().unwrap();
+ 
+         web_client
+-            .get_or_insert_with(|| Client::builder().http1_only().build().unwrap())
++            .get_or_insert_with(|| {
++                let builder = Client::builder();
++                // WASM SPIKE: reqwest's wasm fetch backend ClientBuilder has no
++                // `http1_only()`; the browser controls the HTTP version.
++                #[cfg(not(target_family = "wasm"))]
++                let builder = builder.http1_only();
++                builder.build().unwrap()
++            })
+             .clone()
+     }
+ 
+diff --git a/rslib/src/scheduler/mod.rs b/rslib/src/scheduler/mod.rs
+index 93aee3c..92818cc 100644
+--- a/rslib/src/scheduler/mod.rs
++++ b/rslib/src/scheduler/mod.rs
+@@ -12,7 +12,9 @@ pub(crate) mod congrats;
+ pub(crate) mod filtered;
+ pub mod fsrs;
+ pub mod new;
+-pub(crate) mod queue;
++// WASM SPIKE (CleanAnki): exposed publicly so an embedder (the wasm bridge) can
++// name `QueuedCard` returned by `Collection::get_next_card`.
++pub mod queue;
+ mod reviews;
+ mod service;
+ pub mod states;
+diff --git a/rslib/src/sync/http_client/io_monitor.rs b/rslib/src/sync/http_client/io_monitor.rs
+index 602b672..0455074 100644
+--- a/rslib/src/sync/http_client/io_monitor.rs
++++ b/rslib/src/sync/http_client/io_monitor.rs
+@@ -100,6 +100,7 @@ impl IoMonitor {
+ 
+     /// Takes care of encoding provided request data and setting content type to
+     /// binary, and returns the decompressed response body.
++    #[cfg(not(target_family = "wasm"))]
+     pub async fn zstd_request_with_timeout(
+         &self,
+         request: RequestBuilder,
+@@ -155,6 +156,24 @@ impl IoMonitor {
+             }
+         }
+     }
++
++    /// WASM SPIKE (CleanAnki): reqwest's wasm fetch backend has no streaming
++    /// `Body::wrap_stream`, and its response streams are `!Send`, so the
++    /// streaming monitor above cannot compile for wasm. Sync is never invoked
++    /// from the wasm bridge, so this stub just returns an error.
++    #[cfg(target_family = "wasm")]
++    pub async fn zstd_request_with_timeout(
++        &self,
++        _request: RequestBuilder,
++        _request_body: Vec<u8>,
++        _stall_duration: Duration,
++    ) -> HttpResult<Vec<u8>> {
++        Err(HttpError {
++            code: StatusCode::NOT_IMPLEMENTED,
++            context: "sync transport is unavailable in the wasm build".into(),
++            source: None,
++        })
++    }
+ }
+ 
+ /// Reqwest can't retry a redirected request as the body has been consumed, so
+diff --git a/rslib/src/sync/mod.rs b/rslib/src/sync/mod.rs
+index 447c6f3..255ce91 100644
+--- a/rslib/src/sync/mod.rs
++++ b/rslib/src/sync/mod.rs
+@@ -4,6 +4,9 @@
+ pub mod collection;
+ pub mod error;
+ pub mod http_client;
++// WASM SPIKE: the embedded sync server uses axum::serve + tokio::net + tokio::signal,
++// which cannot compile for wasm targets (mio). Gated behind `sync-server`.
++#[cfg(feature = "sync-server")]
+ pub mod http_server;
+ pub mod login;
+ pub mod media;

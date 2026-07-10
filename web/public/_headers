@@ -1,0 +1,13 @@
+# Netlify / Cloudflare Pages headers file.
+#
+# The Rust core (rslib) is compiled for Emscripten with pthread emulation, which
+# means it needs real Web Workers backed by SharedArrayBuffer (for its SQLite
+# storage layer and its tokio/rayon thread pools). SharedArrayBuffer is only
+# available on cross-origin-isolated pages, which requires the server to send
+# COOP/COEP on every response — including the production static build, which
+# vite-plugin-pwa's service worker does not do for you.
+#
+# vite.config.ts sets the same two headers for the dev server; keep them in sync.
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp

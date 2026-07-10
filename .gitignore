@@ -1,0 +1,10 @@
+.DS_Store
+
+# Rust build output (rust/wasm-bridge, rust/tools/*, rust/vendor/*) — these get
+# huge (multi-GB with -Z build-std) and are always reproducible from source.
+target/
+
+# Vendored, patched dependencies (anki @ 985MB, systemstat, burn-train) —
+# reproducible via rust/vendor-patches/regen.sh (pristine upstream source +
+# the .patch files there, which ARE tracked). See docs/ARCHITECTURE.md §6/§10.
+rust/vendor/
