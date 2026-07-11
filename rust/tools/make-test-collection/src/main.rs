@@ -15,10 +15,13 @@ use anki::storage::SchemaVersion;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let path = args
-        .next()
-        .expect("usage: make-test-collection <output-path.anki2> [--with-note] (path must not already exist)");
-    let with_note = args.next().as_deref() == Some("--with-note");
+    let path = args.next().expect(
+        "usage: make-test-collection <output-path.anki2> [--with-note|--with-nested-decks] \
+         (path must not already exist)",
+    );
+    let flag = args.next();
+    let with_note = flag.as_deref() == Some("--with-note");
+    let with_nested_decks = flag.as_deref() == Some("--with-nested-decks");
 
     if std::path::Path::new(&path).exists() {
         eprintln!("refusing to overwrite existing file: {path}");
@@ -47,9 +50,37 @@ fn main() {
             .expect("failed to add note");
     }
 
+    if with_nested_decks {
+        // Ad-hoc fixture for verifying web/src/ui/ImportView/DeckTree.tsx:
+        // rslib auto-creates missing parent decks (Collection::add_or_update_deck
+        // -> match_or_create_parents), so creating the deepest deck alone is
+        // enough to produce the whole "Ankizin::M1_Vorklinik::Anatomie" chain
+        // plus a sibling, matching the real-world case that prompted this
+        // (a 57-entry flat deck list that should have rendered as a tree).
+        let deepest = col
+            .get_or_create_normal_deck("Ankizin::M1_Vorklinik::Anatomie")
+            .expect("failed to create nested deck");
+        col.get_or_create_normal_deck("Ankizin::M1_Vorklinik::Physiologie")
+            .expect("failed to create sibling deck");
+        col.get_or_create_normal_deck("Ankizin::M2_Klinik")
+            .expect("failed to create second top-level branch");
+
+        let notetype = col
+            .get_notetype_by_name("Basic")
+            .expect("query failed")
+            .expect("stock 'Basic' notetype missing from fresh collection");
+        let mut note = notetype.new_note();
+        note.set_field(0, "nested-deck test front").unwrap();
+        note.set_field(1, "nested-deck test back").unwrap();
+        col.add_note(&mut note, deepest.id)
+            .expect("failed to add note");
+    }
+
     col.close(Some(SchemaVersion::V18))
         .expect("failed to close collection");
 
     let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-    println!("wrote {path} ({size} bytes, with_note={with_note})");
+    println!(
+        "wrote {path} ({size} bytes, with_note={with_note}, with_nested_decks={with_nested_decks})"
+    );
 }

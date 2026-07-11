@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { motion } from 'framer-motion'
-import { importApkg, listDecks, setCurrentDeck, type Deck } from '../../wasm/backend'
+import { importApkg, listDecks, setCurrentDeck, deleteDeck, type Deck } from '../../wasm/backend'
 import { ensureCollectionReady, persistCollection } from '../../db/collection'
+import DeckTree from './DeckTree'
 
 type Status = 'loading' | 'ready' | 'importing' | 'error'
 
@@ -95,6 +96,30 @@ export default function ImportView() {
     }
   }, [])
 
+  const handleDeleteDeck = useCallback(
+    async (id: bigint, name: string) => {
+      // Real Anki behaviour: deleting a deck cascades to all its subdecks and
+      // every card/note in them — confirm before doing something this
+      // destructive and irreversible (no undo across a page reload; OPFS
+      // gets overwritten by the very next persistCollection()).
+      const ok = window.confirm(
+        `Delete "${name}"? This also deletes every subdeck and all cards/notes in them. This cannot be undone.`,
+      )
+      if (!ok) return
+
+      try {
+        await deleteDeck(id)
+        await persistCollection()
+        if (selectedDeckId === id) setSelectedDeckId(null)
+        await refreshDecks()
+      } catch (err) {
+        setErrorMsg(errorMessage(err))
+        setStatus('error')
+      }
+    },
+    [selectedDeckId, refreshDecks],
+  )
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 8 }}
@@ -143,30 +168,18 @@ export default function ImportView() {
         <p className="text-sm font-medium text-neutral-700 dark:text-neutral-300">
           Decks {status === 'loading' && '(loading…)'}
         </p>
-        <ul className="mt-2 space-y-1">
-          {decks.map((deck) => (
-            <li key={deck.id.toString()}>
-              <button
-                type="button"
-                onClick={() => handleSelectDeck(deck.id)}
-                className={`w-full rounded-lg border px-4 py-2 text-left text-sm transition-colors ${
-                  selectedDeckId === deck.id
-                    ? 'border-neutral-900 bg-neutral-100 font-medium dark:border-neutral-100 dark:bg-neutral-800'
-                    : 'border-neutral-200 hover:bg-neutral-50 dark:border-neutral-700 dark:hover:bg-neutral-900'
-                }`}
-              >
-                {deck.name}
-                {selectedDeckId === deck.id && (
-                  <span className="ml-2 text-xs text-neutral-500 dark:text-neutral-400">
-                    (studying this deck)
-                  </span>
-                )}
-              </button>
-            </li>
-          ))}
-        </ul>
+        <div className="mt-2">
+          <DeckTree
+            decks={decks}
+            selectedDeckId={selectedDeckId}
+            onSelect={handleSelectDeck}
+            onDelete={handleDeleteDeck}
+          />
+        </div>
         <p className="mt-2 text-xs text-neutral-500 dark:text-neutral-400">
-          Pick a deck, then switch to the Study tab.
+          Pick a deck, then switch to the Study tab. Nesting (e.g. "Parent::Child") reflects
+          rslib's `::`-separated deck names — real Anki storage has no tree structure at all,
+          it's parsed from the name here just like the desktop app does.
         </p>
       </div>
     </motion.div>

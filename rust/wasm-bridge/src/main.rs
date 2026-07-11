@@ -34,6 +34,7 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use anki::backend::Backend;
+use anki::card_rendering::strip_av_tags;
 use anki::collection::Collection;
 use anki::collection::CollectionBuilder;
 use anki::import_export::package::ImportAnkiPackageOptions;
@@ -43,6 +44,7 @@ use anki::prelude::I18n;
 use anki::scheduler::answering::CardAnswer;
 use anki::scheduler::answering::Rating;
 use anki::scheduler::queue::QueuedCard;
+use anki::template::RenderedNode;
 use anki::timestamp::TimestampMillis;
 
 /// Where we stage the uploaded collection inside the (emscripten) virtual FS.
@@ -372,6 +374,45 @@ pub extern "C" fn wasm_set_current_deck(deck_id: i64) -> i32 {
     }
 }
 
+/// Deletes a deck **and all of its child decks**, along with every card (and
+/// any note left with no remaining cards) in all of them — this mirrors real
+/// Anki's actual behaviour (`Collection::remove_decks_and_child_decks`
+/// cascades to subdecks unconditionally; there is no "delete this deck only"
+/// mode in rslib itself). The built-in "Default" deck (id 1) is special-cased
+/// by rslib to be reset/renamed rather than truly removed, so deleting it is
+/// harmless.
+///
+/// If the deleted deck was the current deck, `get_current_deck` (used by
+/// `get_next_card`) already falls back to Default on its own the next time
+/// it's called (`decks/current.rs`) — no extra handling needed here.
+///
+/// Returns 0 on success, negative on error.
+#[no_mangle]
+pub extern "C" fn wasm_delete_deck(deck_id: i64) -> i32 {
+    let mut guard = match collection_slot().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            set_last_error("internal lock poisoned");
+            return -2;
+        }
+    };
+    let col = match guard.as_mut() {
+        Some(c) => c,
+        None => {
+            set_last_error("no collection open; call wasm_open_collection first");
+            return -1;
+        }
+    };
+
+    match col.remove_decks_and_child_decks(&[DeckId(deck_id)]) {
+        Ok(_) => 0,
+        Err(e) => {
+            set_last_error(e);
+            -3
+        }
+    }
+}
+
 /// Fetch the next due card. Returns its numeric card id (>= 0), or `-1` if the
 /// queue is empty, or `-2` on error (see `wasm_last_error_*`).
 ///
@@ -411,6 +452,105 @@ pub extern "C" fn wasm_get_next_card() -> i64 {
         Err(e) => {
             set_last_error(e);
             -2
+        }
+    }
+}
+
+/// Concatenates a rendered node list into plain text, handling *every*
+/// `RenderedNode` variant rather than requiring a single `Text` node the way
+/// `RenderCardOutput::question()`/`.answer()`'s convenience accessors do.
+///
+/// Real-world finding (a 46k-note medical-school deck, "Ankizin"): a
+/// malformed Cloze note (its content has no actual `{{c1::...}}` for the
+/// card's ordinal — a genuine data-quality issue in that specific note, not
+/// a bug here) makes `render_card`'s question-side output end up as
+/// *multiple* nodes (an error message text node gets appended to whatever
+/// partial rendering already happened, rather than replacing it — see
+/// `template::render_card`'s `empty_message` handling). `.question()`'s
+/// strict `[RenedNode::Text] => ...` match then falls through to the literal
+/// string `"not fully rendered"` for ~56% of a real sample of that deck's
+/// cards. Flattening every node's text ourselves (both `Text` and
+/// `Replacement`, which — since we always request `partial_render=false` —
+/// should never actually appear unresolved, but concatenating its
+/// `current_text` is a safe fallback if it ever does) surfaces the real
+/// (if sometimes error-message-shaped) content instead.
+fn flatten_rendered_nodes(nodes: &[RenderedNode]) -> String {
+    nodes
+        .iter()
+        .map(|node| match node {
+            RenderedNode::Text { text } => text.as_str(),
+            RenderedNode::Replacement { current_text, .. } => current_text.as_str(),
+        })
+        .collect()
+}
+
+/// Renders the card most recently returned by `wasm_get_next_card` (peeks
+/// `LAST_CARD` — does not consume it; `wasm_answer_card` still does that).
+/// Writes `{"question": "...", "answer": "...", "css": "..."}` (question/
+/// answer HTML with `[sound:...]`-style av tags stripped, since nothing on
+/// the JS side plays audio yet) via the `wasm_last_result_ptr/len` mechanism
+/// (same pattern as `wasm_list_decks`). Returns 0 on success, negative on
+/// error — in particular -1 if no card is currently loaded.
+///
+/// Only fetches question/answer *text*: note fields may reference collection
+/// media (e.g. `<img src="foo.jpg">`), but media files aren't persisted to
+/// OPFS or served anywhere yet (see docs/ARCHITECTURE.md §10.5/§11) — images
+/// will show as broken. Out of scope for this pass; text-only for now.
+#[no_mangle]
+pub extern "C" fn wasm_render_current_card() -> i32 {
+    let cid = match last_card_slot().lock() {
+        Ok(slot) => match slot.as_ref() {
+            Some(queued) => queued.card.id(),
+            None => {
+                set_last_error("no current card; call wasm_get_next_card first");
+                return -1;
+            }
+        },
+        Err(_) => {
+            set_last_error("internal lock poisoned");
+            return -2;
+        }
+    };
+
+    let mut guard = match collection_slot().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            set_last_error("internal lock poisoned");
+            return -2;
+        }
+    };
+    let col = match guard.as_mut() {
+        Some(c) => c,
+        None => {
+            set_last_error("no collection open; call wasm_open_collection first");
+            return -3;
+        }
+    };
+
+    let rendered = match col.render_existing_card(cid, false, false) {
+        Ok(r) => r,
+        Err(e) => {
+            set_last_error(e);
+            return -4;
+        }
+    };
+
+    let question = strip_av_tags(flatten_rendered_nodes(&rendered.qnodes));
+    let answer = strip_av_tags(flatten_rendered_nodes(&rendered.anodes));
+    let payload = serde_json::json!({
+        "question": question,
+        "answer": answer,
+        "css": rendered.css,
+    });
+
+    match serde_json::to_vec(&payload) {
+        Ok(json) => {
+            set_last_result(json);
+            0
+        }
+        Err(e) => {
+            set_last_error(e);
+            -5
         }
     }
 }

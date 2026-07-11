@@ -6,9 +6,11 @@ import {
   type StudySessionEvent,
   type BackendCard,
 } from '../../src/state/studySession'
+import type { CardContent } from '../../src/wasm/backend'
 
-// Mock card for testing
-const mockCard: BackendCard = { id: 1, front: 'Test', back: 'Answer' } as any
+// Mock card/content for testing
+const mockCard: BackendCard = { id: 1 }
+const mockContent: CardContent = { question: 'Q', answer: 'A', css: '.card {}' }
 
 describe('studySessionTransition', () => {
   it('starts from idle state on START event', () => {
@@ -22,7 +24,7 @@ describe('studySessionTransition', () => {
     expect(state.status).toBe('loading')
   })
 
-  it('transitions to reviewing when card is loaded', () => {
+  it('transitions to reviewing (content not yet loaded) when card is loaded', () => {
     const loadingState: StudySessionState = { status: 'loading' }
     const state = studySessionTransition(loadingState, {
       type: 'CARD_LOADED',
@@ -31,6 +33,8 @@ describe('studySessionTransition', () => {
     expect(state.status).toBe('reviewing')
     if (state.status === 'reviewing') {
       expect(state.card).toBe(mockCard)
+      expect(state.content).toBeNull()
+      expect(state.revealed).toBe(false)
     }
   })
 
@@ -50,13 +54,78 @@ describe('studySessionTransition', () => {
   })
 
   it('ignores QUEUE_EMPTY when not in loading state', () => {
-    const reviewingState: StudySessionState = { status: 'reviewing', card: mockCard }
+    const reviewingState: StudySessionState = {
+      status: 'reviewing',
+      card: mockCard,
+      content: null,
+      revealed: false,
+    }
     const state = studySessionTransition(reviewingState, { type: 'QUEUE_EMPTY' })
     expect(state.status).toBe('reviewing')
   })
 
-  it('transitions to answered when card is answered', () => {
-    const reviewingState: StudySessionState = { status: 'reviewing', card: mockCard }
+  it('stores content on CONTENT_LOADED while reviewing', () => {
+    const reviewingState: StudySessionState = {
+      status: 'reviewing',
+      card: mockCard,
+      content: null,
+      revealed: false,
+    }
+    const state = studySessionTransition(reviewingState, {
+      type: 'CONTENT_LOADED',
+      content: mockContent,
+    })
+    expect(state.status).toBe('reviewing')
+    if (state.status === 'reviewing') {
+      expect(state.content).toBe(mockContent)
+      expect(state.revealed).toBe(false)
+    }
+  })
+
+  it('ignores CONTENT_LOADED when not reviewing', () => {
+    const idleState: StudySessionState = { status: 'idle' }
+    const state = studySessionTransition(idleState, {
+      type: 'CONTENT_LOADED',
+      content: mockContent,
+    })
+    expect(state.status).toBe('idle')
+  })
+
+  it('reveals the answer once content has loaded', () => {
+    const reviewingState: StudySessionState = {
+      status: 'reviewing',
+      card: mockCard,
+      content: mockContent,
+      revealed: false,
+    }
+    const state = studySessionTransition(reviewingState, { type: 'REVEAL' })
+    expect(state.status).toBe('reviewing')
+    if (state.status === 'reviewing') {
+      expect(state.revealed).toBe(true)
+    }
+  })
+
+  it('ignores REVEAL before content has loaded', () => {
+    const reviewingState: StudySessionState = {
+      status: 'reviewing',
+      card: mockCard,
+      content: null,
+      revealed: false,
+    }
+    const state = studySessionTransition(reviewingState, { type: 'REVEAL' })
+    expect(state.status).toBe('reviewing')
+    if (state.status === 'reviewing') {
+      expect(state.revealed).toBe(false)
+    }
+  })
+
+  it('transitions to answered when a revealed card is graded', () => {
+    const reviewingState: StudySessionState = {
+      status: 'reviewing',
+      card: mockCard,
+      content: mockContent,
+      revealed: true,
+    }
     const state = studySessionTransition(reviewingState, {
       type: 'ANSWER',
       ease: 3,
@@ -64,8 +133,23 @@ describe('studySessionTransition', () => {
     expect(state.status).toBe('answered')
     if (state.status === 'answered') {
       expect(state.card).toBe(mockCard)
+      expect(state.content).toBe(mockContent)
       expect(state.ease).toBe(3)
     }
+  })
+
+  it('ignores ANSWER before the answer has been revealed', () => {
+    const reviewingState: StudySessionState = {
+      status: 'reviewing',
+      card: mockCard,
+      content: mockContent,
+      revealed: false,
+    }
+    const state = studySessionTransition(reviewingState, {
+      type: 'ANSWER',
+      ease: 3,
+    })
+    expect(state.status).toBe('reviewing')
   })
 
   it('ignores ANSWER when not in reviewing state', () => {
@@ -81,6 +165,7 @@ describe('studySessionTransition', () => {
     const answeredState: StudySessionState = {
       status: 'answered',
       card: mockCard,
+      content: mockContent,
       ease: 3,
     }
     const state = studySessionTransition(answeredState, { type: 'NEXT' })
@@ -88,7 +173,12 @@ describe('studySessionTransition', () => {
   })
 
   it('ignores NEXT when not in answered state', () => {
-    const reviewingState: StudySessionState = { status: 'reviewing', card: mockCard }
+    const reviewingState: StudySessionState = {
+      status: 'reviewing',
+      card: mockCard,
+      content: null,
+      revealed: false,
+    }
     const state = studySessionTransition(reviewingState, { type: 'NEXT' })
     expect(state.status).toBe('reviewing')
   })
@@ -112,14 +202,21 @@ describe('studySessionTransition', () => {
   })
 
   it('resets to idle on RESET event', () => {
-    const reviewingState: StudySessionState = { status: 'reviewing', card: mockCard }
+    const reviewingState: StudySessionState = {
+      status: 'reviewing',
+      card: mockCard,
+      content: null,
+      revealed: false,
+    }
     const state = studySessionTransition(reviewingState, { type: 'RESET' })
     expect(state.status).toBe('idle')
   })
 
   it('returns unchanged state for unknown events', () => {
     const idleState: StudySessionState = { status: 'idle' }
-    const state = studySessionTransition(idleState, { type: 'UNKNOWN' } as any)
+    const state = studySessionTransition(idleState, {
+      type: 'UNKNOWN',
+    } as unknown as StudySessionEvent)
     expect(state).toBe(idleState)
   })
 })

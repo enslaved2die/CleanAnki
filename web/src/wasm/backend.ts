@@ -41,12 +41,29 @@ const GLOBAL_FACTORY_NAME = 'AnkiWasmBridgeModule'
  * Must match `COLLECTION_PATH` in rust/wasm-bridge/src/main.rs exactly. */
 const COLLECTION_PATH = '/anki/collection.anki2'
 
-/** Card returned by `get_next_card`. `rslib`'s scheduler only ever hands the
- * bridge a numeric card id (a millisecond timestamp) plus scheduling state
- * the bridge doesn't currently surface — the id is all we render for now
- * (a full note-field renderer is out of scope for this phase). */
+/** Card returned by `get_next_card`. Just the id — the actual rendered
+ * content is a separate round trip via `getCurrentCardContent()` (mirrors
+ * the bridge: `wasm_get_next_card` only returns an id, `wasm_render_current_card`
+ * renders whatever card is currently loaded). */
 export interface BackendCard {
   id: number
+}
+
+/** Rendered HTML for the card most recently returned by `getNextCard`.
+ * `question`/`answer` are real Anki template output (`Collection::render_existing_card`)
+ * with `[sound:...]`-style av tags stripped server-side — nothing here plays
+ * audio yet. `css` is the notetype's own stylesheet; the caller is
+ * responsible for scoping it (see StudyView) since it's written assuming
+ * classic Anki's `.card` container convention, not ours.
+ *
+ * Known gap: note fields may reference collection media (`<img src="...">`)
+ * — media files aren't persisted/served anywhere yet (see
+ * docs/ARCHITECTURE.md §10.5/§11), so images will show broken. Text-only
+ * for this phase. */
+export interface CardContent {
+  question: string
+  answer: string
+  css: string
 }
 
 /** Result of a sync attempt. `sync_with_server` is still a stub on the Rust
@@ -85,7 +102,9 @@ interface EmscriptenModule {
   // *parameters* as native JS BigInt too, the same as it does for
   // wasm_get_next_card's i64 *return*. See docs/ARCHITECTURE.md §10.
   _wasm_set_current_deck(deckId: bigint): number
+  _wasm_delete_deck(deckId: bigint): number
   _wasm_get_next_card(): bigint
+  _wasm_render_current_card(): number
   _wasm_answer_card(ease: number): number
   _wasm_sync_with_server(
     endpointPtr: number,
@@ -312,6 +331,22 @@ export async function setCurrentDeck(deckId: bigint): Promise<void> {
   }
 }
 
+/**
+ * Deletes a deck **and all of its child decks**, plus every card (and any
+ * note left with no cards) in all of them — this cascades, matching real
+ * Anki's own behaviour (rslib has no "this deck only" delete mode). If the
+ * deleted deck was selected, the bridge falls back to the Default deck on
+ * its own next time `getNextCard` is called — callers don't need to also
+ * call `setCurrentDeck` afterward.
+ */
+export async function deleteDeck(deckId: bigint): Promise<void> {
+  const mod = await loadModule()
+  const rc = mod._wasm_delete_deck(deckId)
+  if (rc !== 0) {
+    throw new Error(`wasm_delete_deck failed (${rc}): ${readLastError(mod)}`)
+  }
+}
+
 export async function getNextCard(): Promise<BackendCard | null> {
   const mod = await loadModule()
   const id = mod._wasm_get_next_card()
@@ -320,6 +355,18 @@ export async function getNextCard(): Promise<BackendCard | null> {
     throw new Error(`wasm_get_next_card failed (${id}): ${readLastError(mod)}`)
   }
   return { id: Number(id) }
+}
+
+/** Renders the card most recently returned by `getNextCard` — call this
+ * right after a successful `getNextCard()` (it renders whatever the bridge's
+ * `LAST_CARD` slot currently holds; there's no card-id parameter). */
+export async function getCurrentCardContent(): Promise<CardContent> {
+  const mod = await loadModule()
+  const rc = mod._wasm_render_current_card()
+  if (rc !== 0) {
+    throw new Error(`wasm_render_current_card failed (${rc}): ${readLastError(mod)}`)
+  }
+  return JSON.parse(readLastResult(mod)) as CardContent
 }
 
 export async function answerCard(ease: number): Promise<void> {

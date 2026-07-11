@@ -61,7 +61,9 @@ fn main() {
         "_wasm_import_apkg",
         "_wasm_list_decks",
         "_wasm_set_current_deck",
+        "_wasm_delete_deck",
         "_wasm_get_next_card",
+        "_wasm_render_current_card",
         "_wasm_answer_card",
         "_wasm_sync_with_server",
     ];

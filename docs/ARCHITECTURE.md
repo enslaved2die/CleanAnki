@@ -1022,3 +1022,139 @@ much larger than anything tested above:
   clicked "Spanisch 5000" in the real `ImportView` deck list, switched to the
   real `StudyView` tab, got card id `1586782689812` — matching my own
   independent Node run exactly. Zero console errors.
+
+---
+
+## 11. 2026-07-11 — Real card content (question/answer/CSS) + a nested deck tree UI
+
+Addresses the user's feedback: "I only see Card ID as content." Adds
+`Collection::render_existing_card` to the bridge and a proper Anki review
+flow (question → reveal answer → grade) to `StudyView`, plus fixes
+`ImportView`'s deck list to render a real `::`-nested tree instead of a flat
+list of full paths (the thing that made Ankizin's 57 decks look like
+"separate collections" — they aren't; rslib has no tree structure in storage
+at all, hierarchy is purely the `::` in the name string, and real Anki's
+desktop app does the same client-side parsing to display a tree).
+
+The implementing agent stalled (background-task watchdog, no progress for
+600s) partway through this — twice, in fact, across this project. Both times
+it had already done the hard, real diagnostic work and left a clear, working
+fix one mechanical step from being wired in; I finished the wiring myself
+and independently verified the result rather than re-running the agent.
+
+### 11.1 Rust bridge: `wasm_render_current_card`
+
+`rust/wasm-bridge/src/main.rs` — renders whatever `LAST_CARD` currently holds
+via `Collection::render_existing_card(cid, false, false)`
+(`rslib/src/notetype/render.rs:46`), strips `[sound:...]`-style av tags with
+rslib's own `strip_av_tags` (`card_rendering/mod.rs`), and returns
+`{"question", "answer", "css"}` JSON via the existing `wasm_last_result_*`
+mechanism.
+
+**A real bug the agent found and root-caused, which I then finished fixing**:
+`RenderCardOutput::question()`/`.answer()` are *strict* — they only return
+real text when `qnodes`/`anodes` reduce to exactly one `RenderedNode::Text`;
+any other shape falls through to the literal string `"not fully rendered"`.
+Testing against the actual Ankizin deck, the agent found this hit **~56% of
+a real sample** — caused by malformed Cloze notes (no `{{c1::...}}` in the
+card's ordinal, a genuine data-quality issue in that specific deck, not a
+bug here) making `render_card` emit an error-message node *appended to* a
+partial-render node rather than replacing it, so the output is multiple
+nodes instead of one clean `Text` node. The agent wrote the fix
+(`flatten_rendered_nodes`, which concatenates every node's text — `Text` and
+`Replacement` alike) but stalled before wiring it into
+`wasm_render_current_card` (which still called the strict `.question()`/
+`.answer()`). I wired it in (`rust/wasm-bridge/src/main.rs`, two lines) and
+independently re-verified with a **new** test script
+(`rust/wasm-bridge/smoke-test/render_test.mjs`, not the agent's own): a fresh
+40-card real sample from Ankizin came back with **zero** `"not fully
+rendered"` hits, and I specifically hit the exact malformed-Cloze case by
+hand — it now correctly surfaces the real error content
+(`<div>No cloze ⁨1⁩ found on card...`), i.e. the same honest error message
+real Anki desktop would also show for that malformed note, not a
+paper-over.
+
+**Known scope boundary, not chased**: note fields may contain
+`<img src="...">` referencing collection media. Media files aren't
+persisted to OPFS or served anywhere (§10.5) — images show broken. Text-only
+for this pass.
+
+### 11.2 `StudyView`: a real question → reveal → grade flow
+
+Previously the UI skipped straight to grading buttons next to a bare card
+id. `web/src/state/studySession.ts`'s `reviewing` state gained `content:
+CardContent | null` and `revealed: boolean`; new events `CONTENT_LOADED` and
+`REVEAL`; `ANSWER` is now only a valid transition once `revealed` is true.
+Real flow: card id loads → `getCurrentCardContent()` fetches question/
+answer/css → question shown alone → "Show Answer" → answer + ease buttons
+shown → grade → next card.
+
+Content renders inside a new `CardFrame` component (`StudyView/CardFrame.tsx`)
+using a **sandboxed `<iframe srcDoc>`**, not `dangerouslySetInnerHTML`
+directly on the page — deliberate choice over trying to scope/prefix
+notetype CSS ourselves: real notetype stylesheets assume they own the whole
+page (bare element selectors, `.mobile .disabled`-style rules, etc.),
+confirmed against real imported decks, and correctly rewriting arbitrary
+author CSS to scope it is a genuinely fiddly parsing problem. The iframe
+gives free, perfect isolation both directions. `sandbox` deliberately omits
+`allow-scripts` — real card templates do embed `<script>` blocks (confirmed:
+Ankizin's cards ship a hint-reveal-shortcut script), and those should not
+execute with imported, untrusted deck content. `allow-same-origin` is kept
+only so the parent can read `scrollHeight` to auto-size the iframe.
+
+**Verified in the actual browser** (not just the render fix above): the
+bundled starter fixture's question ("smoke-test front") shows alone with a
+"Show Answer" button; clicking it reveals the answer ("smoke-test back")
+with a divider plus the four ease buttons. Zero console errors.
+
+### 11.3 `ImportView`: a real deck tree
+
+New `web/src/ui/ImportView/DeckTree.tsx` — `buildDeckTree` parses every
+deck's full `::`-joined name back into a real tree client-side (exported
+separately for unit testing), rendered with per-level indentation and
+collapse/expand toggles. Clicking a node still calls `setCurrentDeck` exactly
+as before (parent-deck selection aggregating subdeck cards was already
+confirmed working in §10.6 — pure rendering fix, no bridge change needed).
+
+**Verified in the actual browser** against the real Ankizin file: after
+import, the tree correctly showed "Ankizin" as a collapsible root with
+"M1_Vorklinik" → "Anatomie" → "Makroskopische_Anatomie" → its own children
+nested and indented beneath it, instead of 57 unrelated-looking flat rows.
+
+---
+
+## 12. 2026-07-11 — Delete-deck function
+
+The user asked for a way to delete decks. Implemented directly (not
+delegated — by this point the API research and file locations were already
+well-established from prior phases, so a fresh agent round-trip wasn't worth
+the overhead).
+
+**Rust**: `wasm_delete_deck(deck_id: i64) -> i32`
+(`rust/wasm-bridge/src/main.rs`) calls
+`Collection::remove_decks_and_child_decks(&[DeckId(deck_id)])`
+(`rslib/src/decks/remove.rs:6`) — confirmed from source this **cascades**:
+deleting a deck deletes every child deck and all cards (and any
+now-orphaned notes) in all of them, exactly matching real Anki desktop
+behaviour (there is no "this deck only" delete mode in rslib itself). The
+built-in "Default" deck (id 1) is special-cased by rslib to be reset/renamed
+rather than truly removed, so deleting it is harmless. If the deleted deck
+was the current deck, `get_current_deck()` already falls back to Default on
+its own the next time it's called (`decks/current.rs:16-21`) — no extra
+handling needed in the bridge.
+
+**TypeScript/UI**: `deleteDeck(deckId)` in `backend.ts`; a "Delete" action
+per node in `DeckTree.tsx`, threaded through from `ImportView`, gated behind
+a `window.confirm` (cascading, irreversible — no undo across a reload since
+the very next `persistCollection()` overwrites OPFS).
+
+**Verified in the actual browser** against the real, freshly re-imported
+Ankizin deck (46,729 notes / 53,205 cards / 57 decks): deleted the top-level
+"Ankizin" deck — confirmed all 57 decks disappeared in one action (a broader,
+even more convincing cascade test than originally planned — an incidental
+selector bug in my own test script matched the outer "Ankizin" row instead
+of an inner one, which turned out to be a better test), leaving only
+"Default". **Confirmed the deletion actually persisted, not just in-memory**:
+after a full page reload, the deck list still showed only "Default" and
+`StudyView` fell back to the starter fixture's own card. Zero console
+errors throughout.
