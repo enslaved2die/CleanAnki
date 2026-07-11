@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { motion } from 'framer-motion'
-import { importApkg, listDecks, setCurrentDeck, deleteDeck, type Deck } from '../../wasm/backend'
+import { importApkg, listDecks, setCurrentDeck } from '../../wasm/backend'
 import { ensureCollectionReady, persistCollection, persistMedia } from '../../db/collection'
-import DeckTree from './DeckTree'
 
 type Status = 'loading' | 'ready' | 'importing' | 'error'
 
@@ -11,31 +10,21 @@ function errorMessage(err: unknown): string {
 }
 
 /**
- * Import a real `.apkg` file and pick which deck `StudyView` should study.
- *
- * Deck selection works by calling `setCurrentDeck`, which durably updates the
- * *backend's own* current-deck config (persisted to OPFS via
- * `persistCollection`) — there's no separate "selected deck" state to lift
- * up to `StudyView`. `StudyView` remounts (and re-fetches `getNextCard`)
- * whenever the user navigates back to the Study tab (see App.tsx), so it
- * naturally picks up whatever deck was last selected here.
+ * Import a real `.apkg` file. Deck selection/management (which deck to
+ * study, deleting decks) lives on the Home tab (see `ui/HomeView`), which
+ * shows the real deck tree with per-deck New/Learn/Due counts matching real
+ * Anki's deck-overview screen — this view used to duplicate a second,
+ * counts-less deck picker (`DeckTree.tsx`, now deleted); consolidated so
+ * there's a single place deck state is shown and changed.
  */
 export default function ImportView() {
   const [status, setStatus] = useState<Status>('loading')
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
-  const [decks, setDecks] = useState<Deck[]>([])
-  const [selectedDeckId, setSelectedDeckId] = useState<bigint | null>(null)
   const [pickedFile, setPickedFile] = useState<File | null>(null)
   const [lastImportMs, setLastImportMs] = useState<number | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
 
   const bootstrapped = useRef(false)
-
-  const refreshDecks = useCallback(async () => {
-    const list = await listDecks()
-    setDecks(list)
-    return list
-  }, [])
 
   useEffect(() => {
     if (bootstrapped.current) return
@@ -43,21 +32,20 @@ export default function ImportView() {
     ;(async () => {
       try {
         await ensureCollectionReady()
-        await refreshDecks()
         setStatus('ready')
       } catch (err) {
         setErrorMsg(errorMessage(err))
         setStatus('error')
       }
     })()
-  }, [refreshDecks])
+  }, [])
 
   const handleImport = useCallback(async () => {
     if (!pickedFile) return
     setStatus('importing')
     setErrorMsg(null)
     try {
-      const previousIds = new Set(decks.map((d) => d.id))
+      const previousIds = new Set((await listDecks()).map((d) => d.id))
       const bytes = new Uint8Array(await pickedFile.arrayBuffer())
       const t0 = performance.now()
       await importApkg(bytes)
@@ -74,17 +62,17 @@ export default function ImportView() {
         )
       }
 
-      const updated = await refreshDecks()
+      const updated = await listDecks()
       setLastImportMs(elapsed)
       setStatus('ready')
 
       // Quality-of-life: if exactly one new deck appeared, select it
-      // automatically instead of leaving the user on "Default".
+      // automatically instead of leaving the user on "Default". The Home tab
+      // is the place to see/change this afterward.
       const newDecks = updated.filter((d) => !previousIds.has(d.id))
       if (newDecks.length === 1) {
         await setCurrentDeck(newDecks[0].id)
         await persistCollection()
-        setSelectedDeckId(newDecks[0].id)
       }
 
       setPickedFile(null)
@@ -93,42 +81,7 @@ export default function ImportView() {
       setErrorMsg(errorMessage(err))
       setStatus('error')
     }
-  }, [pickedFile, decks, refreshDecks])
-
-  const handleSelectDeck = useCallback(async (id: bigint) => {
-    try {
-      await setCurrentDeck(id)
-      await persistCollection()
-      setSelectedDeckId(id)
-    } catch (err) {
-      setErrorMsg(errorMessage(err))
-      setStatus('error')
-    }
-  }, [])
-
-  const handleDeleteDeck = useCallback(
-    async (id: bigint, name: string) => {
-      // Real Anki behaviour: deleting a deck cascades to all its subdecks and
-      // every card/note in them — confirm before doing something this
-      // destructive and irreversible (no undo across a page reload; OPFS
-      // gets overwritten by the very next persistCollection()).
-      const ok = window.confirm(
-        `Delete "${name}"? This also deletes every subdeck and all cards/notes in them. This cannot be undone.`,
-      )
-      if (!ok) return
-
-      try {
-        await deleteDeck(id)
-        await persistCollection()
-        if (selectedDeckId === id) setSelectedDeckId(null)
-        await refreshDecks()
-      } catch (err) {
-        setErrorMsg(errorMessage(err))
-        setStatus('error')
-      }
-    },
-    [selectedDeckId, refreshDecks],
-  )
+  }, [pickedFile])
 
   return (
     <motion.div
@@ -164,7 +117,7 @@ export default function ImportView() {
 
       {lastImportMs !== null && (
         <p className="text-xs text-neutral-500 dark:text-neutral-400">
-          Last import took {lastImportMs.toFixed(0)}ms.
+          Last import took {lastImportMs.toFixed(0)}ms. See the Home tab for your decks.
         </p>
       )}
 
@@ -173,25 +126,6 @@ export default function ImportView() {
           {errorMsg}
         </div>
       )}
-
-      <div>
-        <p className="text-sm font-medium text-neutral-700 dark:text-neutral-300">
-          Decks {status === 'loading' && '(loading…)'}
-        </p>
-        <div className="mt-2">
-          <DeckTree
-            decks={decks}
-            selectedDeckId={selectedDeckId}
-            onSelect={handleSelectDeck}
-            onDelete={handleDeleteDeck}
-          />
-        </div>
-        <p className="mt-2 text-xs text-neutral-500 dark:text-neutral-400">
-          Pick a deck, then switch to the Study tab. Nesting (e.g. "Parent::Child") reflects
-          rslib's `::`-separated deck names — real Anki storage has no tree structure at all,
-          it's parsed from the name here just like the desktop app does.
-        </p>
-      </div>
     </motion.div>
   )
 }

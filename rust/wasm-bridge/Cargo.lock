@@ -145,6 +145,7 @@ name = "anki-wasm-bridge"
 version = "0.1.0"
 dependencies = [
  "anki",
+ "anki_proto",
  "serde_json",
 ]
 

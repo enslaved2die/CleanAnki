@@ -45,6 +45,8 @@ use anki::scheduler::answering::Rating;
 use anki::scheduler::queue::QueuedCard;
 use anki::template::RenderedNode;
 use anki::timestamp::TimestampMillis;
+use anki::timestamp::TimestampSecs;
+use anki_proto::decks::DeckTreeNode;
 
 /// Where we stage the uploaded collection inside the (emscripten) virtual FS.
 /// On wasm32-unknown-emscripten this is MEMFS by default; persisting across
@@ -462,6 +464,75 @@ pub extern "C" fn wasm_delete_deck(deck_id: i64) -> i32 {
         Err(e) => {
             set_last_error(e);
             -3
+        }
+    }
+}
+
+/// Hand-rolled JSON serialization of a `DeckTreeNode` (recursively, including
+/// `children`), matching the manual-JSON style used elsewhere in this file
+/// (see `wasm_list_decks`) rather than pulling in `serde::Serialize` for a
+/// type we don't own. `deck_id` is written as a **string**, not a JSON number
+/// — same reasoning as `wasm_list_decks`: it's an i64 that can exceed
+/// `Number.MAX_SAFE_INTEGER`'s exact range in JS.
+fn deck_tree_node_to_json(node: &DeckTreeNode) -> serde_json::Value {
+    serde_json::json!({
+        "deckId": node.deck_id.to_string(),
+        "name": node.name,
+        "newCount": node.new_count,
+        "learnCount": node.learn_count,
+        "reviewCount": node.review_count,
+        "collapsed": node.collapsed,
+        "filtered": node.filtered,
+        "children": node.children.iter().map(deck_tree_node_to_json).collect::<Vec<_>>(),
+    })
+}
+
+/// Returns the full deck tree (names + due counts, nested by `::` hierarchy)
+/// as JSON, written via `wasm_last_result_ptr/len`. Mirrors the real Anki
+/// desktop deck-overview screen ("Stapelübersicht": Neu/Nochmal/Fällig per
+/// deck).
+///
+/// Passes `Some(now)` to `Collection::deck_tree` (rather than `None`) so the
+/// due-count fields are actually populated — `None` is only for tree-shape
+/// queries that don't need counts (e.g. the plain deck picker in ImportView,
+/// which still uses `wasm_list_decks`). This also unburies any cards buried on
+/// a previous day, matching what opening the real deck list does.
+///
+/// Returns 0 on success, negative on error (see `wasm_last_error_*`).
+#[no_mangle]
+pub extern "C" fn wasm_get_deck_tree() -> i32 {
+    let mut guard = match collection_slot().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            set_last_error("internal lock poisoned");
+            return -2;
+        }
+    };
+    let col = match guard.as_mut() {
+        Some(c) => c,
+        None => {
+            set_last_error("no collection open; call wasm_open_collection first");
+            return -1;
+        }
+    };
+
+    let tree = match col.deck_tree(Some(TimestampSecs::now())) {
+        Ok(t) => t,
+        Err(e) => {
+            set_last_error(e);
+            return -3;
+        }
+    };
+
+    let json = deck_tree_node_to_json(&tree);
+    match serde_json::to_vec(&json) {
+        Ok(bytes) => {
+            set_last_result(bytes);
+            0
+        }
+        Err(e) => {
+            set_last_error(e);
+            -4
         }
     }
 }

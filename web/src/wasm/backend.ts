@@ -78,6 +78,23 @@ export interface Deck {
   name: string
 }
 
+/** A node of the tree returned by `getDeckTree`, mirroring real Anki's deck
+ * overview screen ("Stapelübersicht": Neu/Nochmal/Fällig per deck). `deckId`
+ * is a `bigint` for the same reason as `Deck.id` above. `newCount`/
+ * `learnCount`/`reviewCount` are already-limited, already-including-children
+ * counts (i.e. exactly what real Anki's deck list displays), not raw totals —
+ * see `Collection::deck_tree`'s doc comment in the vendored rslib source. */
+export interface DeckTreeNode {
+  deckId: bigint
+  name: string
+  newCount: number
+  learnCount: number
+  reviewCount: number
+  collapsed: boolean
+  filtered: boolean
+  children: DeckTreeNode[]
+}
+
 /** Raw shape of the object Emscripten's MODULARIZE factory resolves to.
  * Only the pieces this module actually touches are declared. */
 interface EmscriptenModule {
@@ -96,6 +113,7 @@ interface EmscriptenModule {
   _wasm_checkpoint(): number
   _wasm_import_apkg(ptr: number, len: number): number
   _wasm_list_decks(): number
+  _wasm_get_deck_tree(): number
   // `deck_id` is a genuine i64 parameter, not just an i64 return — confirmed
   // empirically (not just assumed) that -sWASM_BIGINT=1 marshals i64
   // *parameters* as native JS BigInt too, the same as it does for
@@ -346,6 +364,43 @@ export async function listDecks(): Promise<Deck[]> {
   }
   const pairs = JSON.parse(readLastResult(mod)) as [string, string][]
   return pairs.map(([id, name]) => ({ id: BigInt(id), name }))
+}
+
+/** Raw JSON shape `wasm_get_deck_tree` writes (`deckId` as a string, same
+ * `Number.MAX_SAFE_INTEGER` concern as `listDecks`/`Deck.id`). */
+interface RawDeckTreeNode {
+  deckId: string
+  name: string
+  newCount: number
+  learnCount: number
+  reviewCount: number
+  collapsed: boolean
+  filtered: boolean
+  children: RawDeckTreeNode[]
+}
+
+function parseDeckTreeNode(raw: RawDeckTreeNode): DeckTreeNode {
+  return {
+    ...raw,
+    deckId: BigInt(raw.deckId),
+    children: raw.children.map(parseDeckTreeNode),
+  }
+}
+
+/**
+ * Fetches the full deck tree (names + due counts, nested by `::` hierarchy),
+ * matching real Anki's deck overview screen. The top-level returned node is
+ * itself synthetic (rslib's internal tree root, not a real deck) — its own
+ * `deckId`/`name`/counts are meaningless; iterate `children` for the actual
+ * top-level decks.
+ */
+export async function getDeckTree(): Promise<DeckTreeNode> {
+  const mod = await loadModule()
+  const rc = mod._wasm_get_deck_tree()
+  if (rc !== 0) {
+    throw new Error(`wasm_get_deck_tree failed (${rc}): ${readLastError(mod)}`)
+  }
+  return parseDeckTreeNode(JSON.parse(readLastResult(mod)) as RawDeckTreeNode)
 }
 
 /**

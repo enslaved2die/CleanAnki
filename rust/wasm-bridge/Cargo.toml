@@ -47,6 +47,15 @@ path = "../vendor/anki/rslib"
 package = "anki"
 default-features = false
 
+# rslib doesn't re-export `DeckTreeNode` (unlike several other proto types it
+# re-exports under anki::decks::*, e.g. DeckKind) — needed directly in
+# wasm_get_deck_tree to walk the tree and serialize the real due-count fields.
+# Same path anki's own workspace Cargo.toml uses (`rslib/proto` relative to the
+# anki repo root); Cargo resolves this to the identical crate anki itself was
+# built against, no duplicate compile.
+[dependencies.anki_proto]
+path = "../vendor/anki/rslib/proto"
+
 # WASM SPIKE: systemstat 0.2.7 (pulled transitively via fsrs -> burn -> burn-train)
 # has no `target_os = "emscripten"` platform impl and fails to compile. The vendored
 # copy adds an "unsupported"-returning stub. See docs/ARCHITECTURE.md (2026-07-10).

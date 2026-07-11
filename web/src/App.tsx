@@ -1,19 +1,21 @@
 import { useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
+import HomeView from './ui/HomeView'
 import StudyView from './ui/StudyView'
 import ImportView from './ui/ImportView'
 import SyncSettings from './ui/SyncSettings'
 
-type View = 'study' | 'import' | 'sync'
+type View = 'home' | 'study' | 'import' | 'sync'
 
 const tabs: { id: View; label: string }[] = [
+  { id: 'home', label: 'Home' },
   { id: 'study', label: 'Study' },
   { id: 'import', label: 'Import' },
   { id: 'sync', label: 'Sync' },
 ]
 
 function App() {
-  const [view, setView] = useState<View>('study')
+  const [view, setView] = useState<View>('home')
 
   return (
     <div className="min-h-svh bg-neutral-50 text-neutral-900 dark:bg-neutral-950 dark:text-neutral-100">
@@ -65,6 +67,7 @@ function App() {
             exit={{ opacity: 0, y: -8 }}
             transition={{ duration: 0.18 }}
           >
+            {view === 'home' && <HomeView onStudyDeck={() => setView('study')} />}
             {view === 'study' && <StudyView />}
             {view === 'import' && <ImportView />}
             {view === 'sync' && <SyncSettings />}

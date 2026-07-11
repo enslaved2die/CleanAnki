@@ -1466,3 +1466,58 @@ Node-harness runs: **35 consecutive successes, 0 failures**, against 15/15
 
 Full test suite (`npm --prefix web test -- --run`) still passes (37/37) after
 the fix; a fresh `bash rust/wasm-bridge/build.sh` is clean.
+
+## 16. 2026-07-11 — Real deck-overview / home screen
+
+Requested after the user shared a screenshot of real Anki desktop's deck list
+("Stapelübersicht": Neu/Nochmal/Fällig — New/Learn/Due — per deck). The goal
+was a Home screen you land on that shows every deck's due counts and lets you
+jump straight into studying one, matching that screen.
+
+**New bridge export: `wasm_get_deck_tree`.** rslib already has exactly what's
+needed — `Collection::deck_tree(Some(timestamp))` — which:
+- builds the real `::`-nested hierarchy (unlike `wasm_list_decks`, which
+  returns a flat `(id, name)` list the JS side had to re-parse into a tree
+  client-side — see §11's `DeckTree.tsx`/`buildDeckTree`),
+- unburies previous-day-buried cards (matching what opening the real deck
+  list does),
+- and populates `new_count`/`learn_count`/`review_count` — already
+  limit-applied and already including children, i.e. exactly the numbers real
+  Anki's deck list shows, not raw unfiltered totals.
+
+`DeckTreeNode` (the proto type) isn't re-exported by `anki::decks::*` the way
+several sibling types are (`DeckKind`, `FilteredSearchTerm`, ...), so
+`rust/wasm-bridge/Cargo.toml` gained a direct path dependency on
+`anki_proto` (`../vendor/anki/rslib/proto` — the identical crate anki's own
+workspace resolves to, so no duplicate compile) just to name the type. The
+tree is hand-serialized to JSON recursively (`deck_tree_node_to_json`, same
+manual-JSON style as `wasm_list_decks` — no `serde::Serialize` derive on a
+type this crate doesn't own), with `deckId` as a **string** (same
+`Number.MAX_SAFE_INTEGER` overflow reasoning as every other deck id in this
+bridge).
+
+**Consolidated the two deck-list UIs into one.** Before this, `ImportView`
+had its own deck picker (`DeckTree.tsx` + `buildDeckTree`, parsing
+`wasm_list_decks`' flat names back into a tree client-side, no due counts) for
+"pick which deck to study." That's now `HomeView`'s job — it shows the real
+backend-built tree with counts and doubles as deck selection (click a deck
+name → `setCurrentDeck` + persist → hand off to the Study tab) and deletion
+(same cascading `deleteDeck` as before). `ImportView` was cut down to just the
+file-picker/import flow (still auto-selects a newly-imported deck
+programmatically, matching prior behaviour, just without its own picker UI to
+show the result). `DeckTree.tsx` and its test were deleted outright rather
+than left as dead code — the real backend tree fully supersedes the
+client-side name-parsing one.
+
+`App.tsx` gained a `home` tab, first in the tab order and the default view on
+load — the user lands on the deck overview first, same as real Anki's
+"deck list" being the app's home screen rather than dropping straight into a
+review session.
+
+Verified in the real browser against OPFS-persisted state from the earlier
+Spanish-deck import: Home correctly shows `Default` (1 new) and
+`Spanisch 5000` (14 new, 5 learn); clicking `Spanisch 5000` switches to Study
+and immediately renders a real card from that deck. `ImportView` still
+functions standalone with the picker removed. Full test suite passes (33/33
+— down from 37/37, the 4 removed `DeckTree.test.ts` cases; no coverage lost,
+that logic no longer exists).
