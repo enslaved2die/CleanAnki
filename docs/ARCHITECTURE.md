@@ -1522,6 +1522,46 @@ functions standalone with the picker removed. Full test suite passes (33/33
 — down from 37/37, the 4 removed `DeckTree.test.ts` cases; no coverage lost,
 that logic no longer exists).
 
+## 17. 2026-07-11 — Real sync attempt: hard-blocked on reqwest's wasm backend needing wasm-bindgen
+
+Attempted to wire up real Anki sync (`sync_login` + `NormalSyncer::sync`)
+against the user's self-hosted `anki-sync-server`. Every sync HTTP call in
+rslib funnels through one function,
+`IoMonitor::zstd_request_with_timeout` (`rust/vendor/anki/rslib/src/sync/http_client/io_monitor.rs`),
+which was previously stubbed to always return "not implemented" for wasm
+(the `mio`/`tokio-net` blocker from §2-4 was already fixed for everything
+*except* this one transport function). The plan was: implement a real
+non-streaming version (reqwest-wasm has no streaming `Body`/response
+support) and see how far the existing, unmodified sync protocol logic gets.
+
+**Derisking result: a hard `LinkError`, not a fixable flag.** reqwest 0.12's
+wasm backend (`reqwest-0.12.28/src/wasm/`) calls the browser's `fetch()` via
+`wasm_bindgen`/`js_sys`/`web_sys` — externs that need the `wasm-bindgen` CLI's
+generated JS glue to resolve. This project deliberately never runs that CLI
+(it doesn't understand Emscripten's `MODULARIZE` output at all — see the
+doc comment atop `rust/wasm-bridge/src/main.rs`), so those imports are
+unsatisfiable. Concretely tested: building a `reqwest::RequestBuilder`
+(`.post(url).header(...).build()`) needs only **one** missing symbol
+(`__wbindgen_throw`, from `Client::new()`'s internal `unwrap_throw`) — but
+actually calling `.send()` to dispatch the request pulls in **58** undefined
+wasm-bindgen-JS-interop symbols. This is a real toolchain incompatibility,
+not a missing Cargo feature: reqwest's wasm transport and an Emscripten-only,
+non-wasm-bindgen build are fundamentally at odds.
+
+A real fix exists but is substantial new engineering, not a quick patch: skip
+reqwest's `.send()` path entirely and implement a custom transport — e.g. run
+the sync operation on a background pthread (this build already has
+pthreads/`SharedArrayBuffer` working for other things) and call Emscripten's
+own native `emscripten_fetch` C API in its synchronous mode (a standard,
+well-documented pattern for blocking HTTP from a worker thread in Emscripten
+C/C++/Rust code, requiring no wasm-bindgen at all). This was not attempted —
+scoped as a distinct, uncertain follow-up rather than open-ended work in this
+session. Presented to the user as a real decision point (continue now vs.
+pause); they chose to pause and prioritize the statistics view instead. All
+throwaway derisking code (`wasm_test_fetch`, the temporary `reqwest`/`tokio`
+deps) was removed; the tree is back to exactly its pre-attempt state
+(`wasm_sync_with_server` is still the original stub).
+
 ## 18. 2026-07-11 — FSRS as the default scheduling algorithm
 
 Requested directly: make FSRS (Free Spaced Repetition Scheduler) the active
@@ -1556,3 +1596,38 @@ revealed and graded a real card ("Good") — `answer_card` completed and
 advanced to the next card with no error, confirming FSRS-backed scheduling
 runs end-to-end through the exact same UI flow as before. Full test suite
 still passes (33/33).
+
+## 19. 2026-07-11 — Statistics view
+
+New `wasm_get_stats` bridge export, backed by the same real computation real
+Anki desktop's stats screen uses: `Collection::graphs` (the `StatsService`
+trait's `graphs(GraphsRequest)`, at `anki::services::StatsService` —
+`rust/vendor/anki/rslib/src/stats/service.rs`) and `Collection::studied_today`.
+`GraphsResponse` is a large protobuf message (15 optional sub-messages,
+mostly `HashMap<day/interval, count>` chart-bucket data meant for client-side
+chart rendering) — impractical and unnecessary to hand-serialize wholesale,
+so this bridge picks out a handful of scalar headline numbers instead:
+
+- `today` (answer count/correct count/time/mature-correct) — direct fields on
+  `GraphsResponse.today`, no computation needed.
+- `cardCounts` (new/learn/relearn/young/mature/suspended/buried) — direct
+  fields on `GraphsResponse.card_counts.including_inactive`.
+- `dueToday`/`dueThisWeek`/`backlog` — summed ourselves from
+  `GraphsResponse.future_due.future_due`, a `HashMap<i32, u32>` keyed by day
+  offset from today (0 = due today, negative = overdue backlog); see
+  `rust/vendor/anki/rslib/src/stats/graphs/future_due.rs`. This map already
+  covers every non-suspended card regardless of the `days` request
+  parameter (that only bounds the revlog window for charts not exposed
+  here), so `days: 365` in the request is just a generous, arbitrary value.
+- `fsrs` — `GraphsResponse.fsrs`, a nice free confirmation that §18's
+  scheduling change is actually active.
+- `studiedTodayText` — `Collection::studied_today()`'s real, translated
+  "Studied N cards in M minutes today" sentence, used verbatim.
+
+New `StatisticsView` (web/src/ui/StatisticsView/index.tsx), added as a
+"Stats" tab in `App.tsx` between Import and Sync. Verified in the real
+browser against the existing Spanish-deck study session: showed "Studied 29
+cards..." (83% correct), `Scheduling algorithm: FSRS` (confirming §18), due
+counts, and card-count breakdown (14996 new, 4 in learning) — all real
+numbers matching what had actually happened in this session, not placeholder
+data. Full test suite passes (33/33), typecheck clean, fresh wasm build clean.

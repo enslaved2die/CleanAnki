@@ -3,14 +3,16 @@ import { AnimatePresence, motion } from 'framer-motion'
 import HomeView from './ui/HomeView'
 import StudyView from './ui/StudyView'
 import ImportView from './ui/ImportView'
+import StatisticsView from './ui/StatisticsView'
 import SyncSettings from './ui/SyncSettings'
 
-type View = 'home' | 'study' | 'import' | 'sync'
+type View = 'home' | 'study' | 'import' | 'stats' | 'sync'
 
 const tabs: { id: View; label: string }[] = [
   { id: 'home', label: 'Home' },
   { id: 'study', label: 'Study' },
   { id: 'import', label: 'Import' },
+  { id: 'stats', label: 'Stats' },
   { id: 'sync', label: 'Sync' },
 ]
 
@@ -70,6 +72,7 @@ function App() {
             {view === 'home' && <HomeView onStudyDeck={() => setView('study')} />}
             {view === 'study' && <StudyView />}
             {view === 'import' && <ImportView />}
+            {view === 'stats' && <StatisticsView />}
             {view === 'sync' && <SyncSettings />}
           </motion.div>
         </AnimatePresence>

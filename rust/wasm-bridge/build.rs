@@ -64,6 +64,7 @@ fn main() {
         "_wasm_set_current_deck",
         "_wasm_delete_deck",
         "_wasm_get_deck_tree",
+        "_wasm_get_stats",
         "_wasm_list_media_files",
         "_wasm_read_media_file",
         "_wasm_write_media_file",

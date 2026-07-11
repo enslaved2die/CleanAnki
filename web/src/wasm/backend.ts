@@ -95,6 +95,40 @@ export interface DeckTreeNode {
   children: DeckTreeNode[]
 }
 
+/** Summary statistics from `getStats`, backed by real rslib computation
+ * (`Collection::graphs`/`Collection::studied_today` — the same data real
+ * Anki desktop's stats screen is built from). This is a hand-picked subset of
+ * scalar headline numbers, not the full chart-bucket payload — see
+ * rust/wasm-bridge/src/main.rs's `wasm_get_stats` doc comment for why. */
+export interface Stats {
+  /** Whether FSRS (vs. legacy SM-2) is the active scheduling algorithm. */
+  fsrs: boolean
+  /** Real Anki's own translated "Studied N cards in M minutes today" sentence. */
+  studiedTodayText: string
+  today: {
+    answerCount: number
+    answerMillis: number
+    correctCount: number
+    matureCount: number
+    matureCorrect: number
+  }
+  cardCounts: {
+    newCards: number
+    learn: number
+    relearn: number
+    young: number
+    mature: number
+    suspended: number
+    buried: number
+  }
+  /** Cards due today, per rslib's `future_due` forecast. */
+  dueToday: number
+  /** Cards due within the next 7 days (today included). */
+  dueThisWeek: number
+  /** Overdue cards (were due on a previous day and haven't been studied). */
+  backlog: number
+}
+
 /** Raw shape of the object Emscripten's MODULARIZE factory resolves to.
  * Only the pieces this module actually touches are declared. */
 interface EmscriptenModule {
@@ -114,6 +148,7 @@ interface EmscriptenModule {
   _wasm_import_apkg(ptr: number, len: number): number
   _wasm_list_decks(): number
   _wasm_get_deck_tree(): number
+  _wasm_get_stats(): number
   // `deck_id` is a genuine i64 parameter, not just an i64 return — confirmed
   // empirically (not just assumed) that -sWASM_BIGINT=1 marshals i64
   // *parameters* as native JS BigInt too, the same as it does for
@@ -401,6 +436,19 @@ export async function getDeckTree(): Promise<DeckTreeNode> {
     throw new Error(`wasm_get_deck_tree failed (${rc}): ${readLastError(mod)}`)
   }
   return parseDeckTreeNode(JSON.parse(readLastResult(mod)) as RawDeckTreeNode)
+}
+
+/**
+ * Fetches summary statistics for the whole collection (headline numbers only
+ * — see `Stats`'s doc comment for why this isn't the full chart-data payload).
+ */
+export async function getStats(): Promise<Stats> {
+  const mod = await loadModule()
+  const rc = mod._wasm_get_stats()
+  if (rc !== 0) {
+    throw new Error(`wasm_get_stats failed (${rc}): ${readLastError(mod)}`)
+  }
+  return JSON.parse(readLastResult(mod)) as Stats
 }
 
 /**

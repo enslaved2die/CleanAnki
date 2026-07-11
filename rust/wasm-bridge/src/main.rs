@@ -44,10 +44,12 @@ use anki::prelude::I18n;
 use anki::scheduler::answering::CardAnswer;
 use anki::scheduler::answering::Rating;
 use anki::scheduler::queue::QueuedCard;
+use anki::services::StatsService;
 use anki::template::RenderedNode;
 use anki::timestamp::TimestampMillis;
 use anki::timestamp::TimestampSecs;
 use anki_proto::decks::DeckTreeNode;
+use anki_proto::stats::GraphsRequest;
 
 /// Where we stage the uploaded collection inside the (emscripten) virtual FS.
 /// On wasm32-unknown-emscripten this is MEMFS by default; persisting across
@@ -552,6 +554,123 @@ pub extern "C" fn wasm_get_deck_tree() -> i32 {
         Err(e) => {
             set_last_error(e);
             -4
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Statistics
+// ---------------------------------------------------------------------------
+
+/// Returns a summary of real collection statistics as JSON, written via
+/// `wasm_last_result_ptr/len`. Backed by `Collection::graphs` (the same
+/// `StatsService::graphs` real Anki desktop's full chart-rendering stats
+/// screen calls) and `Collection::studied_today` — this bridge just picks out
+/// the handful of scalar fields cheap to show as headline numbers, rather
+/// than hand-serializing `GraphsResponse` wholesale (most of it is
+/// day/interval `HashMap` chart-bucket data meant for client-side chart
+/// rendering, not a summary payload).
+///
+/// `search: ""` means "the whole collection" (`graph_data_for_search` treats
+/// an empty/whitespace-only search as `all = true` — see
+/// rust/vendor/anki/rslib/src/stats/graphs/mod.rs). `days` only bounds the
+/// revlog window for `added`/`reviews`-style charts we don't expose here;
+/// `future_due` (the due-forecast counts below) always covers every
+/// non-suspended card regardless of `days`, so the exact value doesn't matter
+/// for what we read back — 365 is just a reasonable, generous window.
+///
+/// Returns 0 on success, negative on error (see `wasm_last_error_*`).
+#[no_mangle]
+pub extern "C" fn wasm_get_stats() -> i32 {
+    let mut guard = match collection_slot().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            set_last_error("internal lock poisoned");
+            return -2;
+        }
+    };
+    let col = match guard.as_mut() {
+        Some(c) => c,
+        None => {
+            set_last_error("no collection open; call wasm_open_collection first");
+            return -1;
+        }
+    };
+
+    let studied_today_text = match col.studied_today() {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(e);
+            return -3;
+        }
+    };
+
+    let graphs = match col.graphs(GraphsRequest {
+        search: String::new(),
+        days: 365,
+    }) {
+        Ok(g) => g,
+        Err(e) => {
+            set_last_error(e);
+            return -4;
+        }
+    };
+
+    let today = graphs.today.unwrap_or_default();
+    let counts = graphs
+        .card_counts
+        .and_then(|c| c.including_inactive)
+        .unwrap_or_default();
+
+    // `future_due`'s keys are a day offset from "today" (0 = due today, 1 =
+    // tomorrow, negative = overdue backlog) — see
+    // rust/vendor/anki/rslib/src/stats/graphs/future_due.rs. Sum the buckets
+    // ourselves rather than exposing the raw map; the UI only needs a few
+    // headline numbers, not a full forecast chart.
+    let future_due = graphs.future_due.unwrap_or_default();
+    let due_today: u32 = future_due.future_due.get(&0).copied().unwrap_or(0);
+    let due_this_week: u32 = (0..7)
+        .map(|day| future_due.future_due.get(&day).copied().unwrap_or(0))
+        .sum();
+    let backlog: u32 = future_due
+        .future_due
+        .iter()
+        .filter(|(day, _)| **day < 0)
+        .map(|(_, count)| *count)
+        .sum();
+
+    let payload = serde_json::json!({
+        "fsrs": graphs.fsrs,
+        "studiedTodayText": studied_today_text,
+        "today": {
+            "answerCount": today.answer_count,
+            "answerMillis": today.answer_millis,
+            "correctCount": today.correct_count,
+            "matureCount": today.mature_count,
+            "matureCorrect": today.mature_correct,
+        },
+        "cardCounts": {
+            "newCards": counts.new_cards,
+            "learn": counts.learn,
+            "relearn": counts.relearn,
+            "young": counts.young,
+            "mature": counts.mature,
+            "suspended": counts.suspended,
+            "buried": counts.buried,
+        },
+        "dueToday": due_today,
+        "dueThisWeek": due_this_week,
+        "backlog": backlog,
+    });
+
+    match serde_json::to_vec(&payload) {
+        Ok(bytes) => {
+            set_last_result(bytes);
+            0
+        }
+        Err(e) => {
+            set_last_error(e);
+            -5
         }
     }
 }
