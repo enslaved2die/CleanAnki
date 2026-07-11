@@ -1158,3 +1158,311 @@ of an inner one, which turned out to be a better test), leaving only
 after a full page reload, the deck list still showed only "Default" and
 `StudyView` fell back to the starter fixture's own card. Zero console
 errors throughout.
+
+---
+
+## 13. 2026-07-11 — Media (audio + images) that actually works, persisted across reloads
+
+Addresses the user's report: "cards can come with audio and images, both are
+not working." Both are now real: `[sound:...]` tokens render as playable
+`<audio controls>` widgets and `<img src="file">` references show the real
+image, and both survive a page reload. Verified against the real
+`Spanisch_5000.apkg` (6853 media files, 218 MB) in the actual browser.
+
+### 13.1 The two gaps that were closed
+
+1. `wasm_render_current_card` used to run rslib's `strip_av_tags` over the
+   question/answer HTML, which **deletes** `[sound:file.mp3]` tags entirely
+   (rslib parses them as `SoundOrVideo` nodes and `write_without_av_tags`
+   drops them). It now returns the HTML **verbatim** — `[sound:...]` tokens and
+   `<img>` tags intact — and the JS layer resolves them. The `strip_av_tags`
+   import was removed from `main.rs`.
+2. Media files existed only on Emscripten's in-memory FS
+   (`/anki/collection.media`, written there by `import_apkg`'s own
+   `MediaManager`), which is wiped on every reload. They're now copied out to
+   OPFS after import and read back from OPFS at render time.
+
+### 13.2 Rust bridge additions (`rust/wasm-bridge/src/main.rs`, `build.rs`)
+
+Three new `extern "C"` exports (all added to `build.rs`'s `EXPORTED_FUNCTIONS`),
+operating on `MEDIA_FOLDER = "/anki/collection.media"` (derived, as documented
+in §10.1, from `COLLECTION_PATH` via rslib's `with_extension("media")`):
+
+- `wasm_list_media_files() -> i32` — `std::fs::read_dir` the media folder,
+  JSON-encode the filenames via `set_last_result`. A missing folder yields
+  `[]`, not an error (a collection with no media is normal).
+- `wasm_read_media_file(name_ptr, name_len) -> i32` — `std::fs::read` the named
+  file and write its **raw bytes** (not JSON) via `set_last_result`; negative +
+  `set_last_error` if it doesn't exist. The JS side reads these back with a new
+  `readLastResultBytes` helper (a copy of the `LAST_RESULT` buffer that is *not*
+  UTF-8-decoded, unlike `readLastResult`).
+- `wasm_write_media_file(name_ptr, name_len, data_ptr, data_len) -> i32` —
+  `std::fs::write` raw bytes into the media folder (creating it first). Used to
+  restore media into MEMFS; see §13.4 on why this is deliberately *not* on the
+  hot path.
+
+### 13.3 TypeScript layers
+
+- `web/src/wasm/backend.ts`: `listMediaFiles()`, `readMediaFile(name)`,
+  `writeMediaFile(name, bytes)` — same alloc/write/call/dealloc convention as
+  every other export.
+- `web/src/db/opfs.ts`: media stored one-file-per-name under a `media/`
+  subdirectory of the OPFS root (`getDirectoryHandle('media', {create})`).
+  New `writeOpfsMediaFile` / `readOpfsMediaFile` (returns `null` if absent) /
+  `listOpfsMediaFiles`.
+- `web/src/db/collection.ts`: `persistMedia()` copies every file the backend
+  has (`listMediaFiles` → `readMediaFile`) out to OPFS; called from
+  `ImportView` right after `importApkg` + `persistCollection`. Sibling
+  `restoreMediaToBackend()` exists but is intentionally unused on the hot path
+  (§13.4).
+- `web/src/ui/StudyView/media.ts`: `resolveMediaInHtml(html, fetchMedia?)`
+  rewrites `[sound:...]` → `<audio controls>` and bare `<img>/<source>/
+  <audio>/<video>` `src` filenames → inline media (details in §13.5). Wired
+  into `StudyView` so both question and answer HTML are resolved before being
+  handed to `CardFrame`.
+
+### 13.4 Design choice: display reads from OPFS directly; no eager MEMFS restore
+
+The briefed plan was to restore *every* media file back into the wasm backend's
+MEMFS on load (`writeMediaFile` in a loop) and resolve display media by reading
+from MEMFS (`readMediaFile`). Measured, that restore is a real first-load cost
+for large decks, and — crucially — **card rendering never reads media bytes**:
+`render_existing_card` only emits filenames in the HTML. So display media can be
+served straight from OPFS (`readOpfsMediaFile`) with **no** MEMFS rehydration at
+all. This is both faster (nothing on the load hot path) and simpler (works
+identically before and after a reload). `restoreMediaToBackend()` is kept for
+the operations that *do* read media bytes (re-export, media check — none wired
+up yet), but is deliberately off the bootstrap path.
+
+Note this also means the media *database* (`collection.mdb`) and the MEMFS media
+folder are still not persisted — only the collection DB and the media *files*
+(in OPFS). That's fine for display and for re-import (rslib rebuilds media DB
+state as needed); revisit if a media-reading rslib op is ever wired up.
+
+### 13.5 `resolveMediaInHtml`: data: URLs, not blob: URLs
+
+`resolveMediaInHtml` produces **`data:` URLs**, not `blob:` URLs. This is forced
+by the CardFrame sandbox change in §14: the card iframe is now
+`sandbox="allow-scripts"` **without** `allow-same-origin`, giving it an *opaque*
+origin. `blob:` URLs are keyed to the origin that created them, so a
+parent-created `blob:` URL **cannot be loaded from the opaque-origin iframe** —
+this was verified as a real gotcha, exactly the one the original task flagged.
+`data:` URLs carry their bytes inline, are not origin-scoped, and load fine in
+the opaque-origin iframe. They also need no `URL.revokeObjectURL` lifecycle
+management (the blob-URL leak concern the task raised simply doesn't exist), so
+there is nothing to clean up when moving to the next card.
+
+Mechanics: `[sound:...]` tokens are matched on the raw string and replaced with
+`<audio controls preload="metadata" src="data:...">`; `<img>` (and
+`<source>/<audio>/<video>`) `src` attributes are rewritten via `DOMParser` (so
+attribute order/quoting/entities are handled robustly). Filenames are
+`decodeURIComponent`'d (a real file `a b.png` may appear as `a%20b.png`). MIME
+is inferred by extension; bytes → data URL via `FileReader.readAsDataURL` over a
+`Blob`. Missing media: `[sound:]` tokens are dropped (no element to leave); a
+missing `<img>` keeps its bare filename (a visibly-broken image beats silently
+vanishing). Unit-tested in `web/tests/ui/media.test.ts` (7 tests, injectable
+byte source — no browser needed).
+
+### 13.6 Real measurements (Node + browser, `Spanisch_5000.apkg`, 6853 files / 218 MB)
+
+- Node (`rust/wasm-bridge/smoke-test/media_test.mjs`, kept as a standing test):
+  `import_apkg` 995 ms; `wasm_list_media_files` returns 6853 names; reading
+  **all** 6853 files out of MEMFS via `wasm_read_media_file` = **30 ms**;
+  writing all 6853 back via `wasm_write_media_file` = **188 ms**. So the
+  wasm/MEMFS side of media I/O is negligible.
+- Browser (real UI import): import **936 ms**; then `persistMedia()` copying all
+  **6853 files (218 MB) into OPFS = 4151 ms** (~4.2 s, one-time, during import,
+  not on every load). Confirmed OPFS `media/` held all 6853 files afterward.
+- **Reload persistence (the whole point), confirmed:** after a full page reload,
+  OPFS `media/` still held all 6853 files, and `resolveMediaInHtml('<img
+  src="verbo.jpg">[sound:s5000_99_spanisch.mp3]')` produced a real
+  `data:image/...` and a real `data:audio/mpeg;...` read back from OPFS — i.e.
+  the display path works with MEMFS empty, purely off persisted OPFS media.
+
+The 4.2 s per-file OPFS write cost (thousands of `createWritable`/`write`/
+`close` cycles) is the one honest rough edge: acceptable as a one-time import
+step, but if it ever needs to be faster, a single `FileSystemSyncAccessHandle`
+from a worker (already flagged in `opfs.ts`'s header) or batching would help.
+Not optimized now — measured, and left simple.
+
+### 13.7 Verified in the actual browser
+
+- An `<img>` rendered a real image (the "spanisch 5000" logo, then a portrait
+  photo on a vocab card) inside the sandboxed iframe — not broken.
+- A real vocab card ("sein (Eigenschaft, Zeit)" / "ser (irr.)") showed a working
+  `<audio controls>` widget. The audio `data:` URL was fed through
+  `AudioContext.decodeAudioData` in the parent and decoded to genuine audio
+  (0.72 s, 48 kHz, mono MP3) — proving it's real playable sound, not a
+  placeholder.
+- Both survived a full page reload (§13.6).
+- Zero console errors/warnings throughout.
+- (Data-quality aside, not a bug: several `.jpg`-named files in this deck are
+  actually PNG bytes. We label the data URL `image/jpeg` by extension; the
+  browser sniffs and renders them fine.)
+
+---
+
+## 14. 2026-07-11 — Enable card-template scripts (opaque-origin sandbox) + postMessage resize
+
+Addresses two more user reports: (1) the card frame defaulted to a tiny height,
+and (2) some real Spanisch_5000 cards show a "Seite 3" link that "doesn't do
+anything." Both traced to the same root cause: `CardFrame`'s iframe was
+`sandbox="allow-same-origin"` with **no** `allow-scripts`, so the deck's own
+`<script>` blocks and inline `onclick` handlers never ran — the "Seite 3" link
+is an `<a class="hint" onclick="...getElementById('hint...').style.display=
+'inline-block'...">` expand-for-more toggle, and the deck also ships
+text-to-speech and dynamically-generated-text scripts. None executed. The user
+chose (via the coordinator) to enable script execution — same trust model as
+real Anki desktop/mobile, which don't sandbox note-content JS either.
+
+### 14.1 The secure sandbox: `allow-scripts` WITHOUT `allow-same-origin`
+
+`CardFrame.tsx` now uses `sandbox="allow-scripts"` and deliberately **omits**
+`allow-same-origin`. Combining the two on a sandboxed iframe is a well-known
+escape: together they let embedded script reach `window.parent` and drive the
+real app (the iframe is then treated as same-origin with the embedder). Leaving
+`allow-same-origin` off gives the iframe an **opaque** origin — deck scripts run
+but are walled off from the parent app entirely. (This opaque origin is exactly
+why display media had to switch from `blob:` to `data:` URLs — see §13.5.)
+
+### 14.2 Cross-origin-safe auto-resize via postMessage
+
+Dropping `allow-same-origin` breaks the old resize mechanism, which read
+`iframe.contentDocument.body.scrollHeight` (a cross-origin access, now blocked).
+Replaced with the standard pattern: a small measuring script is injected into
+the `srcDoc` `<head>` (ahead of the note's own content); it measures
+`document`/`body` scroll height and reports it to the parent via
+`parent.postMessage({source: 'anki-card-frame', height}, '*')`, re-measuring on
+`load`, on `resize`, on a `ResizeObserver` over the document element, and on two
+short `setTimeout`s (to catch async media/script layout shifts). The parent
+listens for `message` events, validates that `event.source === iframe.contentWindow`
+**and** the distinguishable `{source:'anki-card-frame'}` shape (origin can't be
+validated — it's `"null"` for the opaque iframe), and sets its height state.
+Default height bumped 80 → 120 px so the frame isn't collapsed before the first
+message arrives.
+
+### 14.3 Verification (real browser, real Spanisch_5000 card)
+
+- **Script execution proven, definitively:** the iframe auto-resized from the
+  120 px default to 721 px (logo card) and 986 px (a vocab answer) — a height
+  change is *only* possible if the injected `<script>` ran and posted its
+  message, so `allow-scripts` genuinely executes JS in the opaque sandbox.
+- **"Seite 3" mechanism confirmed wired:** the exact toggle anchor
+  (`<a class="hint" href="#" onclick="this.style.display='none';
+  document.getElementById('hint4753594160').style.display='inline-block';
+  return false;">`) is present in the rendered DOM, and its target
+  `#hint4753594160` exists. It is inline-onclick JS of the same class as the
+  (proven-executing) injected script, so it toggles when clicked. Honest caveat:
+  a *physical* click into the cross-origin sandboxed iframe couldn't be
+  performed with the available preview tooling (CSS-selector clicks don't pierce
+  an opaque-origin frame, and no external Chrome was connected for a coordinate
+  click) — the coordinator will confirm the click itself in a real browser.
+- Deck scripts (TTS `speechSynthesis`, dynamic text) run inside the iframe;
+  any errors they throw are the deck author's, isolated to the iframe, and can't
+  touch the parent app. Zero errors in the *parent* console throughout.
+- `data:`-URL media loads fine in the opaque-origin iframe (§13.5) — confirmed
+  by the image + audio rendering described in §13.7.
+
+---
+
+## 15. 2026-07-11 — Root-caused and fixed the intermittent "reload shows the wrong card" bug
+
+The user reported: after importing a real deck and selecting it, reloading the
+page was flaky — roughly half the time `StudyView` reverted to showing the
+*original bundled starter fixture's* card ("smoke-test front") instead of a
+real card from the imported deck, even though the correct deck's data was
+genuinely sitting in OPFS the whole time (confirmed: `collection.anki2` in
+OPFS was consistently 5,902,336 bytes, matching the imported collection, not
+the 139,264-byte starter).
+
+### 15.1 Ruling out the obvious suspects
+
+Added temporary logging to `ensureCollectionReady()` and confirmed, across
+*multiple reloads where the bug still occurred*: `loadInitialCollectionBytes()`
+correctly returned `5902336` bytes every time, and `openCollection()` /
+`persistCollection()` both completed without throwing every time. So it
+wasn't stale bytes being read from OPFS, and `wasm_open_collection` wasn't
+returning an error. `grep -rn "openCollection("` confirmed exactly one call
+site. This ruled out the naive theories (wrong bytes, a duplicate/racing
+bootstrap path, an error being silently swallowed).
+
+### 15.2 Real root cause: unflushed SQLite WAL
+
+rslib opens collections with `journal_mode = wal` + `locking_mode = exclusive`
+(`rust/vendor/anki/rslib/src/storage/sqlite.rs`). In WAL mode, writes
+(`open_collection`'s own setup, `import_apkg`, `set_current_deck`,
+`answer_card`, `delete_deck`, ...) land in a `<COLLECTION_PATH>-wal` sidecar
+file, not the main `.anki2` file — the main file only gets those writes
+merged in when SQLite performs a **checkpoint**, which under exclusive locking
+happens lazily (not after every write). `readCollectionBytes()` (used by
+`persistCollection()`) only ever read the main file via `Module.FS.readFile(COLLECTION_PATH)`
+— the `-wal` sidecar lives on Emscripten's in-memory MEMFS, which is wiped on
+every page reload, and was never persisted to OPFS at all. So anything still
+sitting in the WAL (which, after a single import + deck selection, is
+*most of the collection* — see the numbers below) was silently lost on every
+reload, and the reopened collection reverted to whatever had last been
+checkpointed — for a fresh app, that's the original starter fixture's state.
+Whether enough operations had accumulated to cross SQLite's own automatic
+WAL-auto-checkpoint threshold (~1000 pages) by chance is what made the bug
+*look* intermittent in casual browser testing — it isn't actually random.
+
+### 15.3 The fix
+
+`rust/wasm-bridge/src/main.rs`: new `wasm_checkpoint()` export, calling
+`col.storage.checkpoint()` (a `PRAGMA wal_checkpoint(TRUNCATE)`-equivalent,
+same mechanism `Collection::maybe_backup` already uses before copying the DB
+for a backup). `web/src/wasm/backend.ts`'s `readCollectionBytes()` now calls
+`wasm_checkpoint()` before reading the main file back out — so every
+`persistCollection()` call (after open, import, deck selection, answering,
+deletion) flushes the WAL first. A no-op checkpoint on an already-flushed WAL
+is harmless, so this is safe to call unconditionally on every persist, not
+just after known-heavy writes.
+
+### 15.4 Verification (real numbers, not a hunch)
+
+A fast, deterministic Node reproduction was built
+(`rust/wasm-bridge/smoke-test/repro_wal.mjs`) that faithfully mimics the
+browser flow in a single process — instance A: open the starter fixture,
+import a real `.apkg`, select the new deck, read the main file back out
+exactly like `persistCollection()` does; instance B (a fresh module instance,
+simulating a reload with MEMFS wiped): write back *only* those main-file
+bytes, open, and check what `get_next_card` returns. It also reports the
+`-wal` sidecar's size before/after the checkpoint call, toggleable via a
+command-line flag so before/after can be compared directly:
+
+```
+$ node repro_wal.mjs Spanisch_5000.apkg 15            # no checkpoint (baseline)
+...wal(before=5887512B after=5887512B) main=5902336B => reload[...] BUG (starter card)
+   (repeated identically for all 15 iterations)
+RESULT: 15/15 reloads showed the starter card (100% failure), checkpoint=false
+
+$ node repro_wal.mjs Spanisch_5000.apkg 15 checkpoint  # with the fix
+...wal(before=5887512B after=0B) main=5902336B => reload[id=1586782689812 ...] ok (real card)
+   (repeated identically for all 15 iterations)
+RESULT: 0/15 reloads showed the starter card (0% failure), checkpoint=true
+```
+
+5.88 MB was sitting unflushed in the WAL — nearly the entire imported
+collection. **100% → 0% failure, deterministically, not a probabilistic
+improvement.**
+
+Also specifically tested the regression risk flagged mid-investigation
+(checkpointing immediately after open, before any import, in case it broke a
+*subsequent* import): opened the starter fixture, checkpointed immediately
+(simulating `ensureCollectionReady`'s unconditional post-open persist), then
+ran a real `import_apkg` against the 220MB Spanish file — succeeded cleanly
+(`rc=0`, 988ms), and a further checkpoint after import also succeeded. No
+reproduction of any regression from this sequence.
+
+Independently re-verified end-to-end in the actual browser (not just Node):
+cleared OPFS entirely (simulating a fresh install), imported the real 220MB
+Spanish deck through the genuine UI (file input → `DataTransfer` → `change`
+event, exact same code path a real user action would take), selected the
+deck, then reloaded **20 times in a row** — every single reload correctly
+showed the real imported card, confirmed both visually (screenshot) and by
+querying `getCurrentCardContent()` directly. Combined with the 15/15 (fixed)
+Node-harness runs: **35 consecutive successes, 0 failures**, against 15/15
+(100%) failures on the same Node harness without the fix.
+
+Full test suite (`npm --prefix web test -- --run`) still passes (37/37) after
+the fix; a fresh `bash rust/wasm-bridge/build.sh` is clean.

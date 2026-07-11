@@ -3,6 +3,7 @@ import { motion, type PanInfo } from 'framer-motion'
 import { studySessionTransition, initialStudySessionState } from '../../state/studySession'
 import { getNextCard, getCurrentCardContent, answerCard } from '../../wasm/backend'
 import { ensureCollectionReady, persistCollection } from '../../db/collection'
+import { resolveMediaInHtml } from './media'
 import CardFrame from './CardFrame'
 
 /** Anki's 1..=4 ease convention, matching `Rating` in rust/wasm-bridge/src/main.rs. */
@@ -32,7 +33,14 @@ export default function StudyView() {
     }
     dispatch({ type: 'CARD_LOADED', card })
     const content = await getCurrentCardContent()
-    dispatch({ type: 'CONTENT_LOADED', content })
+    // Resolve media references (audio/images) into inline data: URLs before
+    // handing the HTML to CardFrame — see media.ts. data: URLs need no
+    // cleanup, so there's no per-card blob-URL lifecycle to manage here.
+    const [question, answer] = await Promise.all([
+      resolveMediaInHtml(content.question),
+      resolveMediaInHtml(content.answer),
+    ])
+    dispatch({ type: 'CONTENT_LOADED', content: { ...content, question, answer } })
   }, [])
 
   useEffect(() => {

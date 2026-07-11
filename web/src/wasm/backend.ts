@@ -50,16 +50,14 @@ export interface BackendCard {
 }
 
 /** Rendered HTML for the card most recently returned by `getNextCard`.
- * `question`/`answer` are real Anki template output (`Collection::render_existing_card`)
- * with `[sound:...]`-style av tags stripped server-side — nothing here plays
- * audio yet. `css` is the notetype's own stylesheet; the caller is
- * responsible for scoping it (see StudyView) since it's written assuming
- * classic Anki's `.card` container convention, not ours.
- *
- * Known gap: note fields may reference collection media (`<img src="...">`)
- * — media files aren't persisted/served anywhere yet (see
- * docs/ARCHITECTURE.md §10.5/§11), so images will show broken. Text-only
- * for this phase. */
+ * `question`/`answer` are real Anki template output
+ * (`Collection::render_existing_card`) returned **verbatim** — `[sound:...]`
+ * audio tokens and `<img src="...">` references are left intact (the bridge no
+ * longer strips av tags). The caller resolves those into playable/visible
+ * media via `resolveMediaInHtml` (see web/src/ui/StudyView/media.ts and
+ * docs/ARCHITECTURE.md §13). `css` is the notetype's own stylesheet; the caller
+ * renders it in a sandboxed iframe (see StudyView/CardFrame) rather than
+ * scoping it, since it assumes classic Anki's `.card` container convention. */
 export interface CardContent {
   question: string
   answer: string
@@ -95,6 +93,7 @@ interface EmscriptenModule {
   _wasm_last_result_len(): number
   _wasm_init_backend(): number
   _wasm_open_collection(ptr: number, len: number): number
+  _wasm_checkpoint(): number
   _wasm_import_apkg(ptr: number, len: number): number
   _wasm_list_decks(): number
   // `deck_id` is a genuine i64 parameter, not just an i64 return — confirmed
@@ -103,6 +102,14 @@ interface EmscriptenModule {
   // wasm_get_next_card's i64 *return*. See docs/ARCHITECTURE.md §10.
   _wasm_set_current_deck(deckId: bigint): number
   _wasm_delete_deck(deckId: bigint): number
+  _wasm_list_media_files(): number
+  _wasm_read_media_file(ptr: number, len: number): number
+  _wasm_write_media_file(
+    namePtr: number,
+    nameLen: number,
+    dataPtr: number,
+    dataLen: number,
+  ): number
   _wasm_get_next_card(): bigint
   _wasm_render_current_card(): number
   _wasm_answer_card(ease: number): number
@@ -203,6 +210,19 @@ function readLastResult(mod: EmscriptenModule): string {
   return new TextDecoder().decode(copy)
 }
 
+/** Reads the current `wasm_last_result_*` buffer as **raw bytes** (a fresh,
+ * non-shared copy). Used by `readMediaFile`, where the payload is arbitrary
+ * binary (an image/audio file) rather than the UTF-8 JSON `readLastResult`
+ * decodes. Must be copied out (not aliased) before any later wasm call
+ * overwrites `LAST_RESULT` or a memory-growth reallocation invalidates the
+ * view. */
+function readLastResultBytes(mod: EmscriptenModule): Uint8Array {
+  const ptr = mod._wasm_last_result_ptr()
+  const len = mod._wasm_last_result_len()
+  if (len === 0) return new Uint8Array(0)
+  return new Uint8Array(mod.HEAPU8.subarray(ptr, ptr + len))
+}
+
 /** Writes `bytes` into a freshly `wasm_alloc`'d buffer, runs `fn` with its
  * `(ptr, len)`, and frees the buffer afterwards regardless of outcome. */
 function withWasmBuffer<T>(
@@ -277,9 +297,21 @@ export async function openCollection(bytes: Uint8Array): Promise<void> {
  * (MEMFS) at `COLLECTION_PATH`. Callers should persist the result to OPFS
  * after `openCollection` and after any mutating call (`answerCard`) — nothing
  * survives a reload otherwise, since MEMFS is purely in-memory.
+ *
+ * Checkpoints the SQLite WAL into the main file *first*. rslib opens
+ * collections in WAL mode with exclusive locking (see
+ * rust/wasm-bridge/src/main.rs `wasm_checkpoint` and docs/ARCHITECTURE.md §15),
+ * so mutations (import, deck selection, answering) land in a `-wal` sidecar
+ * that this read — and therefore OPFS — never captures. Without the flush the
+ * persisted bytes are a stale earlier snapshot, and a reload silently reverts
+ * (e.g. current-deck falls back to Default, showing the bundled starter card).
  */
 export async function readCollectionBytes(): Promise<Uint8Array> {
   const mod = await loadModule()
+  const cp = mod._wasm_checkpoint()
+  if (cp !== 0) {
+    throw new Error(`wasm_checkpoint failed (${cp}): ${readLastError(mod)}`)
+  }
   const view = mod.FS.readFile(COLLECTION_PATH)
   // Defensive copy: `view` may be backed by wasm linear memory that a later
   // call (or a memory-growth reallocation) could invalidate.
@@ -344,6 +376,58 @@ export async function deleteDeck(deckId: bigint): Promise<void> {
   const rc = mod._wasm_delete_deck(deckId)
   if (rc !== 0) {
     throw new Error(`wasm_delete_deck failed (${rc}): ${readLastError(mod)}`)
+  }
+}
+
+/**
+ * Lists the open collection's media filenames (audio/images referenced by
+ * note fields). These live in Emscripten's in-memory FS, written there by
+ * `import_apkg` — enumerate them right after an import so the JS layer can
+ * copy each into OPFS (MEMFS is wiped on reload). Returns `[]` if there is no
+ * media.
+ */
+export async function listMediaFiles(): Promise<string[]> {
+  const mod = await loadModule()
+  const rc = mod._wasm_list_media_files()
+  if (rc !== 0) {
+    throw new Error(`wasm_list_media_files failed (${rc}): ${readLastError(mod)}`)
+  }
+  return JSON.parse(readLastResult(mod)) as string[]
+}
+
+/**
+ * Reads a single media file's raw bytes out of Emscripten's in-memory FS.
+ * Throws if the file doesn't exist there (e.g. after a reload, before it has
+ * been restored) — callers that persist to OPFS should catch and skip, or
+ * read from OPFS instead.
+ */
+export async function readMediaFile(name: string): Promise<Uint8Array> {
+  const mod = await loadModule()
+  const nameBytes = new TextEncoder().encode(name)
+  const rc = withWasmBuffer(mod, nameBytes, (ptr, len) => mod._wasm_read_media_file(ptr, len))
+  if (rc !== 0) {
+    throw new Error(`wasm_read_media_file(${name}) failed (${rc}): ${readLastError(mod)}`)
+  }
+  return readLastResultBytes(mod)
+}
+
+/**
+ * Writes a single media file's raw bytes into Emscripten's in-memory FS
+ * (creating the media folder if needed). Used to restore media from OPFS on
+ * load so rslib operations that touch media stay consistent. Card rendering
+ * itself doesn't need this (it only emits filenames), so display can be served
+ * straight from OPFS — see docs/ARCHITECTURE.md §13.
+ */
+export async function writeMediaFile(name: string, bytes: Uint8Array): Promise<void> {
+  const mod = await loadModule()
+  const nameBytes = new TextEncoder().encode(name)
+  const rc = withWasmBuffer(mod, nameBytes, (namePtr, nameLen) =>
+    withWasmBuffer(mod, bytes, (dataPtr, dataLen) =>
+      mod._wasm_write_media_file(namePtr, nameLen, dataPtr, dataLen),
+    ),
+  )
+  if (rc !== 0) {
+    throw new Error(`wasm_write_media_file(${name}) failed (${rc}): ${readLastError(mod)}`)
   }
 }
 

@@ -4,8 +4,22 @@
 // rust/tools/make-test-collection — see web/scripts/sync-wasm-artifacts.sh);
 // on every later launch, OPFS has the collection as it was last left.
 
-import { opfsFileExists, readOpfsFile, writeOpfsFile } from './opfs'
-import { initBackend, openCollection, readCollectionBytes } from '../wasm/backend'
+import {
+  opfsFileExists,
+  readOpfsFile,
+  writeOpfsFile,
+  writeOpfsMediaFile,
+  readOpfsMediaFile,
+  listOpfsMediaFiles,
+} from './opfs'
+import {
+  initBackend,
+  openCollection,
+  readCollectionBytes,
+  listMediaFiles,
+  readMediaFile,
+  writeMediaFile,
+} from '../wasm/backend'
 
 /** Filename the collection is persisted under at the root of OPFS. */
 const COLLECTION_OPFS_FILENAME = 'collection.anki2'
@@ -47,6 +61,45 @@ export async function loadInitialCollectionBytes(): Promise<Uint8Array> {
 export async function persistCollection(): Promise<void> {
   const bytes = await readCollectionBytes()
   await writeOpfsFile(COLLECTION_OPFS_FILENAME, bytes)
+}
+
+/**
+ * Copies every media file the backend currently has (written into Emscripten's
+ * in-memory FS by `import_apkg`) out to OPFS, so audio/images survive a reload.
+ * Call this after a successful `importApkg` + `persistCollection`.
+ *
+ * Returns the number of files persisted (for logging/telemetry). Files already
+ * in OPFS are simply overwritten — importing a deck that shares media with an
+ * existing one is therefore idempotent, not a conflict.
+ */
+export async function persistMedia(): Promise<number> {
+  const names = await listMediaFiles()
+  for (const name of names) {
+    const bytes = await readMediaFile(name)
+    await writeOpfsMediaFile(name, bytes)
+  }
+  return names.length
+}
+
+/**
+ * Restores every media file persisted in OPFS back into the backend's
+ * in-memory FS. Card *rendering* does not need this (it only emits filenames;
+ * display reads media straight from OPFS — see web/src/wasm/media.ts), so this
+ * is NOT part of the mandatory bootstrap: it exists for rslib operations that
+ * actually read media bytes (re-export, media check) and is deliberately kept
+ * off the first-load hot path because eagerly rehydrating thousands of files
+ * (e.g. Ankizin's ~5.6k) into wasm memory would stall the first render for no
+ * display benefit. See docs/ARCHITECTURE.md §13 for the measured cost.
+ *
+ * Returns the number of files restored.
+ */
+export async function restoreMediaToBackend(): Promise<number> {
+  const names = await listOpfsMediaFiles()
+  for (const name of names) {
+    const bytes = await readOpfsMediaFile(name)
+    if (bytes) await writeMediaFile(name, bytes)
+  }
+  return names.length
 }
 
 // Shared bootstrap so any view (StudyView, the import/deck-picker UI) can

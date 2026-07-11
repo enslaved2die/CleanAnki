@@ -34,7 +34,6 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use anki::backend::Backend;
-use anki::card_rendering::strip_av_tags;
 use anki::collection::Collection;
 use anki::collection::CollectionBuilder;
 use anki::import_export::package::ImportAnkiPackageOptions;
@@ -56,6 +55,15 @@ const COLLECTION_PATH: &str = "/anki/collection.anki2";
 /// `Collection::import_apkg` (which wants a real file path — it opens the zip
 /// itself). Removed again after the import attempt, success or failure.
 const IMPORT_APKG_PATH: &str = "/anki/import.apkg";
+
+/// The collection's media folder inside the (emscripten) virtual FS. rslib
+/// derives this from `COLLECTION_PATH` via `col_path.with_extension("media")`
+/// (see `CollectionBuilder::with_desktop_media_paths`, called in
+/// `wasm_open_collection`), so for `/anki/collection.anki2` it is
+/// `/anki/collection.media`. `import_apkg`'s own `MediaManager` writes imported
+/// media files here; the media-file exports below read/write this same folder
+/// so JS can shuttle them to/from OPFS (MEMFS is wiped on every page reload).
+const MEDIA_FOLDER: &str = "/anki/collection.media";
 
 // rslib's public API is `&mut self` methods on `Collection`, and free wasm
 // functions have no receiver, so we stash process-global state. wasm is
@@ -231,6 +239,51 @@ pub unsafe extern "C" fn wasm_open_collection(ptr: *const u8, len: usize) -> i32
         Err(_) => {
             set_last_error("internal lock poisoned");
             -4
+        }
+    }
+}
+
+/// Flush the SQLite WAL into the main `.anki2` file so the raw bytes read back
+/// out of the virtual FS (by JS `readCollectionBytes` → persisted to OPFS) are
+/// complete and self-contained.
+///
+/// rslib opens collections with `journal_mode = wal` + `locking_mode =
+/// exclusive` (see `storage/sqlite.rs`), so mutating calls — `open_collection`,
+/// `import_apkg`, `set_current_deck`, `answer_card`, `delete_deck` — write into
+/// a `<COLLECTION_PATH>-wal` sidecar rather than the main file, and under
+/// exclusive locking that sidecar is checkpointed only lazily. JS persists only
+/// the main file to OPFS (the `-wal` sidecar lives on MEMFS, which is wiped on
+/// every page reload), so without this flush anything still in the WAL is
+/// silently lost on reload — the reopened collection reverts to an earlier
+/// checkpointed state (e.g. current-deck falls back to Default, showing the
+/// bundled starter card). This mirrors `Collection::maybe_backup`, which calls
+/// `storage.checkpoint()` immediately before copying the DB for a backup.
+///
+/// Returns 0 on success, negative on error. `pragma wal_checkpoint(truncate)`
+/// on an empty WAL is a harmless no-op, so calling this before every read-back
+/// is safe even when nothing was mutated.
+#[no_mangle]
+pub extern "C" fn wasm_checkpoint() -> i32 {
+    let guard = match collection_slot().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            set_last_error("internal lock poisoned");
+            return -2;
+        }
+    };
+    let col = match guard.as_ref() {
+        Some(c) => c,
+        None => {
+            set_last_error("no collection open; call wasm_open_collection first");
+            return -1;
+        }
+    };
+
+    match col.storage.checkpoint() {
+        Ok(()) => 0,
+        Err(e) => {
+            set_last_error(e);
+            -3
         }
     }
 }
@@ -413,6 +466,132 @@ pub extern "C" fn wasm_delete_deck(deck_id: i64) -> i32 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Media files (audio/images referenced by note fields)
+//
+// rslib's `import_apkg` writes a collection's media into MEDIA_FOLDER on the
+// emscripten virtual FS (MEMFS), which is wiped on every page reload. These
+// three exports let the JS layer shuttle those files to/from OPFS (which does
+// persist): after import, enumerate + read each file to copy into OPFS; on
+// load, write them back so rslib operations that touch media stay consistent.
+// (Card *rendering* itself doesn't read media bytes — it only emits filenames
+// in the HTML — so displaying audio/images can be served straight from OPFS
+// without a restore; see docs/ARCHITECTURE.md §13 for the persistence design.)
+// ---------------------------------------------------------------------------
+
+/// Lists the collection's media filenames as a JSON array of strings, e.g.
+/// `["front.jpg","hello.mp3"]`, written via `wasm_last_result_ptr/len`. Only
+/// regular files directly in MEDIA_FOLDER are listed (no recursion — Anki's
+/// media folder is flat). A missing/empty media folder yields `[]`, not an
+/// error. Returns 0 on success, negative on error (see `wasm_last_error_*`).
+#[no_mangle]
+pub extern "C" fn wasm_list_media_files() -> i32 {
+    let mut names: Vec<String> = Vec::new();
+    match std::fs::read_dir(MEDIA_FOLDER) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    if let Some(name) = entry.file_name().to_str() {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+        }
+        // A not-yet-created media folder just means "no media"; anything else
+        // is a real error worth surfacing.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    }
+
+    match serde_json::to_vec(&names) {
+        Ok(json) => {
+            set_last_result(json);
+            0
+        }
+        Err(e) => {
+            set_last_error(e);
+            -2
+        }
+    }
+}
+
+/// Reads a single media file (name given as UTF-8 bytes at `ptr`/`len`) from
+/// MEDIA_FOLDER and writes its **raw bytes** (not JSON) via
+/// `wasm_last_result_ptr/len`. Returns 0 on success, negative on error — in
+/// particular if the file does not exist. The filename is treated as a bare
+/// name inside MEDIA_FOLDER; any path separators would be rejected by the
+/// filesystem, but Anki media names are always flat.
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid, readable byte slice.
+#[no_mangle]
+pub unsafe extern "C" fn wasm_read_media_file(ptr: *const u8, len: usize) -> i32 {
+    let name_bytes = std::slice::from_raw_parts(ptr, len);
+    let name = match std::str::from_utf8(name_bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+
+    let path = std::path::Path::new(MEDIA_FOLDER).join(name);
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            set_last_result(bytes);
+            0
+        }
+        Err(e) => {
+            set_last_error(e);
+            -2
+        }
+    }
+}
+
+/// Writes `data` (raw bytes at `data_ptr`/`data_len`) to
+/// `<MEDIA_FOLDER>/<name>`, where `name` is UTF-8 bytes at
+/// `name_ptr`/`name_len`. Creates MEDIA_FOLDER first if it doesn't exist
+/// (mirroring how `wasm_open_collection` creates COLLECTION_PATH's parent).
+/// Used to restore media from OPFS back into MEMFS. Returns 0 on success,
+/// negative on error.
+///
+/// # Safety
+/// Both `(name_ptr, name_len)` and `(data_ptr, data_len)` must describe valid,
+/// readable byte slices.
+#[no_mangle]
+pub unsafe extern "C" fn wasm_write_media_file(
+    name_ptr: *const u8,
+    name_len: usize,
+    data_ptr: *const u8,
+    data_len: usize,
+) -> i32 {
+    let name_bytes = std::slice::from_raw_parts(name_ptr, name_len);
+    let name = match std::str::from_utf8(name_bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+    let data = std::slice::from_raw_parts(data_ptr, data_len);
+
+    if let Err(e) = std::fs::create_dir_all(MEDIA_FOLDER) {
+        set_last_error(e);
+        return -2;
+    }
+    let path = std::path::Path::new(MEDIA_FOLDER).join(name);
+    match std::fs::write(&path, data) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_last_error(e);
+            -3
+        }
+    }
+}
+
 /// Fetch the next due card. Returns its numeric card id (>= 0), or `-1` if the
 /// queue is empty, or `-2` on error (see `wasm_last_error_*`).
 ///
@@ -486,16 +665,17 @@ fn flatten_rendered_nodes(nodes: &[RenderedNode]) -> String {
 
 /// Renders the card most recently returned by `wasm_get_next_card` (peeks
 /// `LAST_CARD` — does not consume it; `wasm_answer_card` still does that).
-/// Writes `{"question": "...", "answer": "...", "css": "..."}` (question/
-/// answer HTML with `[sound:...]`-style av tags stripped, since nothing on
-/// the JS side plays audio yet) via the `wasm_last_result_ptr/len` mechanism
-/// (same pattern as `wasm_list_decks`). Returns 0 on success, negative on
-/// error — in particular -1 if no card is currently loaded.
+/// Writes `{"question": "...", "answer": "...", "css": "..."}` via the
+/// `wasm_last_result_ptr/len` mechanism (same pattern as `wasm_list_decks`).
+/// Returns 0 on success, negative on error — in particular -1 if no card is
+/// currently loaded.
 ///
-/// Only fetches question/answer *text*: note fields may reference collection
-/// media (e.g. `<img src="foo.jpg">`), but media files aren't persisted to
-/// OPFS or served anywhere yet (see docs/ARCHITECTURE.md §10.5/§11) — images
-/// will show as broken. Out of scope for this pass; text-only for now.
+/// The HTML is returned **verbatim**: `[sound:...]`-style audio tags and
+/// `<img src="...">` references are left intact (we deliberately do NOT call
+/// `strip_av_tags` anymore — that used to delete audio entirely). The JS layer
+/// (see web/src/wasm/media.ts) parses `[sound:...]` into playable `<audio>`
+/// elements and rewrites `<img src>` to blob URLs backed by media files
+/// persisted in OPFS. See docs/ARCHITECTURE.md §13.
 #[no_mangle]
 pub extern "C" fn wasm_render_current_card() -> i32 {
     let cid = match last_card_slot().lock() {
@@ -535,8 +715,8 @@ pub extern "C" fn wasm_render_current_card() -> i32 {
         }
     };
 
-    let question = strip_av_tags(flatten_rendered_nodes(&rendered.qnodes));
-    let answer = strip_av_tags(flatten_rendered_nodes(&rendered.anodes));
+    let question = flatten_rendered_nodes(&rendered.qnodes);
+    let answer = flatten_rendered_nodes(&rendered.anodes);
     let payload = serde_json::json!({
         "question": question,
         "answer": answer,

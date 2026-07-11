@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { motion } from 'framer-motion'
 import { importApkg, listDecks, setCurrentDeck, deleteDeck, type Deck } from '../../wasm/backend'
-import { ensureCollectionReady, persistCollection } from '../../db/collection'
+import { ensureCollectionReady, persistCollection, persistMedia } from '../../db/collection'
 import DeckTree from './DeckTree'
 
 type Status = 'loading' | 'ready' | 'importing' | 'error'
@@ -63,6 +63,16 @@ export default function ImportView() {
       await importApkg(bytes)
       const elapsed = performance.now() - t0
       await persistCollection()
+      // Copy the imported media (audio/images, written into the backend's
+      // in-memory FS by import_apkg) out to OPFS so it survives a reload —
+      // see db/collection.ts and docs/ARCHITECTURE.md §13.
+      const mediaT0 = performance.now()
+      const mediaCount = await persistMedia()
+      if (mediaCount > 0) {
+        console.log(
+          `[import] persisted ${mediaCount} media files to OPFS in ${(performance.now() - mediaT0).toFixed(0)}ms`,
+        )
+      }
 
       const updated = await refreshDecks()
       setLastImportMs(elapsed)

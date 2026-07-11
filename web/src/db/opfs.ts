@@ -91,3 +91,82 @@ export async function deleteOpfsFile(fileName: string): Promise<void> {
     throw err
   }
 }
+
+// ---------------------------------------------------------------------------
+// Collection media (audio/images) — one file per media filename under a
+// `media/` subdirectory of the OPFS root.
+//
+// This is the persistence layer the collection *database* helpers above lack:
+// the wasm backend's media lives on Emscripten's in-memory FS, which is wiped
+// on every reload, so after an import we copy each media file here, and the
+// card renderer reads from here to build data: URLs for <img>/<audio>. See
+// docs/ARCHITECTURE.md §13.
+// ---------------------------------------------------------------------------
+
+/** Name of the OPFS subdirectory holding collection media files. */
+const MEDIA_DIR_NAME = 'media'
+
+/** Minimal structural type for the async-iterable directory handle — the
+ * ambient DOM lib in this project doesn't declare `entries()`/`keys()` on
+ * `FileSystemDirectoryHandle`, though every OPFS-capable browser implements
+ * them (the handle is async-iterable). */
+interface IterableDirectoryHandle extends FileSystemDirectoryHandle {
+  keys(): AsyncIterableIterator<string>
+}
+
+async function getMediaDir(create: boolean): Promise<FileSystemDirectoryHandle | null> {
+  const root = await getOpfsRoot()
+  try {
+    return await root.getDirectoryHandle(MEDIA_DIR_NAME, { create })
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'NotFoundError') {
+      return null // only reachable with create=false
+    }
+    throw err
+  }
+}
+
+/** Writes (overwriting) a single media file into the OPFS `media/` directory. */
+export async function writeOpfsMediaFile(name: string, data: Uint8Array): Promise<void> {
+  const dir = (await getMediaDir(true))!
+  const fileHandle = await dir.getFileHandle(name, { create: true })
+  const writable = await fileHandle.createWritable()
+  try {
+    // Same shared-buffer caveat as writeOpfsFile: copy into a plain
+    // ArrayBuffer-backed view (the bytes may come from the pthread-backed,
+    // SharedArrayBuffer-backed wasm heap, which write() rejects).
+    const copy = new Uint8Array(data.byteLength)
+    copy.set(data)
+    await writable.write(copy)
+  } finally {
+    await writable.close()
+  }
+}
+
+/** Reads a single media file from OPFS `media/`, or `null` if it (or the
+ * media directory) doesn't exist. */
+export async function readOpfsMediaFile(name: string): Promise<Uint8Array | null> {
+  const dir = await getMediaDir(false)
+  if (!dir) return null
+  try {
+    const fileHandle = await dir.getFileHandle(name)
+    const file = await fileHandle.getFile()
+    return new Uint8Array(await file.arrayBuffer())
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'NotFoundError') {
+      return null
+    }
+    throw err
+  }
+}
+
+/** Lists every media filename persisted in OPFS `media/` (empty if none). */
+export async function listOpfsMediaFiles(): Promise<string[]> {
+  const dir = await getMediaDir(false)
+  if (!dir) return []
+  const names: string[] = []
+  for await (const name of (dir as IterableDirectoryHandle).keys()) {
+    names.push(name)
+  }
+  return names
+}
