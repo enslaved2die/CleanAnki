@@ -37,6 +37,7 @@ use anki::backend::Backend;
 use anki::collection::Collection;
 use anki::collection::CollectionBuilder;
 use anki::import_export::package::ImportAnkiPackageOptions;
+use anki::prelude::BoolKey;
 use anki::prelude::CardId;
 use anki::prelude::DeckId;
 use anki::prelude::I18n;
@@ -213,7 +214,7 @@ pub unsafe extern "C" fn wasm_open_collection(ptr: *const u8, len: usize) -> i32
         return -2;
     }
 
-    let col = match CollectionBuilder::new(COLLECTION_PATH)
+    let mut col = match CollectionBuilder::new(COLLECTION_PATH)
         .set_tr(tr)
         .set_server(false)
         // Derives `/anki/collection.media` (dir, created for us) and
@@ -232,6 +233,24 @@ pub unsafe extern "C" fn wasm_open_collection(ptr: *const u8, len: usize) -> i32
             return -3;
         }
     };
+
+    // Make FSRS the active scheduling algorithm (real Anki's own recommended
+    // default for new collections since 23.10). This is a single collection-
+    // level config flag — `BoolKey::Fsrs` — that every scheduling call site
+    // (`get_next_card`, `answer_card`, filtered-deck building) branches on
+    // directly; no per-deck config is required. Left-as-default (empty)
+    // per-deck `fsrs_params` is fully supported: `Collection::answer_card`
+    // constructs `FSRS::new(Some(params))` with an empty params slice, and the
+    // vendored `fsrs` crate treats that as "use its built-in
+    // `DEFAULT_PARAMETERS`," not an error. Set unconditionally on every open
+    // (idempotent — setting `true` when already `true` is a no-op) rather than
+    // only for brand-new collections, since this app has no UI to toggle it
+    // off and imports discard scheduling state anyway (`with_scheduling:
+    // false`, see `wasm_import_apkg`).
+    if let Err(e) = col.set_config_bool(BoolKey::Fsrs, true, false) {
+        set_last_error(e);
+        return -5;
+    }
 
     match collection_slot().lock() {
         Ok(mut guard) => {

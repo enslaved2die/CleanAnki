@@ -1521,3 +1521,38 @@ and immediately renders a real card from that deck. `ImportView` still
 functions standalone with the picker removed. Full test suite passes (33/33
 — down from 37/37, the 4 removed `DeckTree.test.ts` cases; no coverage lost,
 that logic no longer exists).
+
+## 18. 2026-07-11 — FSRS as the default scheduling algorithm
+
+Requested directly: make FSRS (Free Spaced Repetition Scheduler) the active
+algorithm instead of legacy SM-2, matching real Anki's own default for new
+collections since 23.10.
+
+Turned out to be a single collection-level config flag, not a scheduling
+reimplementation or even a per-deck setting: `BoolKey::Fsrs`
+(`rust/vendor/anki/rslib/src/config/bool.rs:40`, re-exported at
+`anki::prelude::BoolKey`). Every real scheduling call site — `answer_card`,
+`get_next_card`'s queue building, filtered-deck building — already branches on
+`self.get_config_bool(BoolKey::Fsrs)` directly; turning it on doesn't touch
+anything else. `wasm_open_collection` (rust/wasm-bridge/src/main.rs) now calls
+```rust
+col.set_config_bool(BoolKey::Fsrs, true, false)?;
+```
+right after building the `Collection`, before it's stored in `COLLECTION`.
+Set unconditionally on every open (idempotent — this app has no UI to turn it
+back off, and imports already discard scheduling state via
+`with_scheduling: false`) rather than only for brand-new collections.
+
+Per-deck FSRS *parameters* (`DeckConfig.inner.fsrs_params_4/5/6`) are left at
+their default `vec![]` — confirmed safe, not an oversight: `answer_card`
+builds `FSRS::new(Some(params))` with whatever `DeckConfig::fsrs_params()`
+returns, and the vendored `fsrs` crate treats an empty slice as "use my
+built-in `DEFAULT_PARAMETERS`," not an error (real Anki desktop does the same
+before a user has ever run "Optimize" to fit personalized weights from their
+own review history).
+
+Verified in the real browser: reloaded, opened the Spanish deck from Home,
+revealed and graded a real card ("Good") — `answer_card` completed and
+advanced to the next card with no error, confirming FSRS-backed scheduling
+runs end-to-end through the exact same UI flow as before. Full test suite
+still passes (33/33).
