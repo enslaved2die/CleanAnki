@@ -44,12 +44,20 @@ use anki::prelude::I18n;
 use anki::scheduler::answering::CardAnswer;
 use anki::scheduler::answering::Rating;
 use anki::scheduler::queue::QueuedCard;
+use anki::search::SortMode;
 use anki::services::StatsService;
+use anki::sync::collection::normal::NormalSyncer;
+use anki::sync::collection::normal::SyncActionRequired;
+use anki::sync::http_client::HttpSyncClient;
+use anki::sync::login::sync_login;
+use anki::sync::login::SyncAuth;
 use anki::template::RenderedNode;
 use anki::timestamp::TimestampMillis;
 use anki::timestamp::TimestampSecs;
 use anki_proto::decks::DeckTreeNode;
 use anki_proto::stats::GraphsRequest;
+use reqwest::Client;
+use reqwest::Url;
 
 /// Where we stage the uploaded collection inside the (emscripten) virtual FS.
 /// On wasm32-unknown-emscripten this is MEMFS by default; persisting across
@@ -107,6 +115,29 @@ fn set_last_result(bytes: Vec<u8>) {
     if let Ok(mut guard) = LAST_RESULT.lock() {
         *guard = bytes;
     }
+}
+
+/// Builds a `reqwest::Client` for the sync exports below. Deliberately NOT
+/// `reqwest::Client::new()`: on the wasm backend that does
+/// `Client::builder().build().unwrap_throw()` (reqwest-0.12.28's
+/// `src/wasm/client.rs:51`), and that one `.unwrap_throw()` — infallible in
+/// practice here, since `ClientBuilder::build()` only ever errors on a config
+/// mistake we never make — is the *only* reason `wasm_bindgen`'s
+/// `__wbindgen_throw` raw import (`wasm-bindgen-0.2.126/src/lib.rs`) is
+/// reachable from our binary at all. Since that import needs the
+/// wasm-bindgen-CLI-generated JS glue this Emscripten build deliberately never
+/// produces (see docs/ARCHITECTURE.md §17), reaching it would fail the module
+/// at *instantiation* (wasm imports are resolved eagerly, whether or not the
+/// code path is ever executed) — confirmed empirically: switching to this
+/// plain `.build()` + `.expect()` (ordinary `Result::expect`, no
+/// `wasm_bindgen` involvement at all) let dead-code elimination drop
+/// `Client::new()`'s body entirely, and with it the only path to
+/// `__wbindgen_throw`, letting the module link and instantiate cleanly. See
+/// docs/ARCHITECTURE.md §20 for the full derisking trail.
+fn build_sync_http_client() -> Client {
+    Client::builder()
+        .build()
+        .expect("reqwest wasm ClientBuilder::build() is infallible for default config")
 }
 
 // ---------------------------------------------------------------------------
@@ -675,6 +706,72 @@ pub extern "C" fn wasm_get_stats() -> i32 {
     }
 }
 
+/// Resets every card in the collection back to "new" (clearing scheduling
+/// state — interval, ease, review counts) and deletes all revlog (review
+/// history) entries, for a genuine fresh start while keeping every imported
+/// deck/note/card. Two real rslib operations, not a single dedicated API:
+///
+/// - `Collection::reschedule_cards_as_new` is real Anki's own "Forget" (the
+///   card browser's Cards → Forget action), applied to every card
+///   (`search_cards("", ...)` — an empty search matches the whole
+///   collection, see rust/vendor/anki/rslib/src/search/parser.rs). Called
+///   with `log: false` (no point logging a "manually rescheduled" revlog
+///   entry when we're about to delete the whole revlog next),
+///   `restore_position: false` (fresh new-card order, not preserving
+///   whatever order cards happened to have before), `reset_counts: true`
+///   (zero `reps`/`lapses`, matching a true "start over").
+/// - Forget alone does NOT touch revlog history (confirmed by reading
+///   rslib's implementation — it only ever *adds* a revlog entry, when
+///   `log: true`, never deletes one), so without a second step the
+///   statistics view would still show old answer counts/correct%/"studied
+///   today" from before the reset. `SqliteStorage::clear_all_revlog_entries`
+///   (added for this — no such bulk-wipe existed in rslib) deletes every
+///   revlog row directly.
+///
+/// Does not reset each deck's daily "new/reviews studied today" counters
+/// (`deck.common`, separate persisted state) — cosmetic only, since card
+/// state itself is fully reset regardless, and it self-corrects at the next
+/// day rollover.
+///
+/// Returns 0 on success, negative on error (see `wasm_last_error_*`).
+#[no_mangle]
+pub extern "C" fn wasm_reset_progress() -> i32 {
+    let mut guard = match collection_slot().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            set_last_error("internal lock poisoned");
+            return -2;
+        }
+    };
+    let col = match guard.as_mut() {
+        Some(c) => c,
+        None => {
+            set_last_error("no collection open; call wasm_open_collection first");
+            return -1;
+        }
+    };
+
+    let cids = match col.search_cards("", SortMode::NoOrder) {
+        Ok(c) => c,
+        Err(e) => {
+            set_last_error(e);
+            return -3;
+        }
+    };
+
+    if let Err(e) = col.reschedule_cards_as_new(&cids, false, false, true, None) {
+        set_last_error(e);
+        return -4;
+    }
+
+    if let Err(e) = col.storage.clear_all_revlog_entries() {
+        set_last_error(e);
+        return -5;
+    }
+
+    0
+}
+
 // ---------------------------------------------------------------------------
 // Media files (audio/images referenced by note fields)
 //
@@ -1016,32 +1113,261 @@ pub extern "C" fn wasm_answer_card(ease: u8) -> i32 {
     }
 }
 
-/// STUB — not implemented in Phase 1. Always returns -1.
-///
-/// rslib's real sync path (`anki::sync::*`) is built on `reqwest`, which on
-/// wasm uses the browser's `fetch()` under the hood but still expects a real
-/// network stack behind it. Wiring a real AnkiWeb sync flow is deliberately
-/// out of scope for this spike.
+// ---------------------------------------------------------------------------
+// Real collection sync (login + normal sync) against AnkiWeb or a self-hosted
+// anki-sync-server.
+//
+// rslib's whole sync protocol (login, meta check, the NormalSyncer algorithm,
+// sanity checks) is unmodified, working rslib logic; the only piece that could
+// not run on this Emscripten build was the HTTP transport — reqwest's wasm
+// `.send()` needs wasm-bindgen JS glue we never generate (docs/ARCHITECTURE.md
+// §17). That one function (`IoMonitor::zstd_request_with_timeout`) is now
+// implemented on top of Emscripten's native synchronous `emscripten_fetch`
+// (see the vendored rslib patch in io_monitor.rs, and §20).
+//
+// Synchronous `emscripten_fetch` blocks on network I/O, which the browser
+// forbids on the main thread. So every sync op runs on a background thread
+// (`std::thread::spawn` → a real Web Worker, proven in §20), driving the async
+// rslib code to completion with a current-thread tokio runtime. The `wasm_*`
+// entry points therefore can't return the result directly: they *start* the
+// work and return immediately, and JS polls `wasm_sync_poll` (the main thread
+// never blocks). Only one sync op runs at a time.
+// ---------------------------------------------------------------------------
+
+/// Sync progress/result, shared between the worker thread and the polling main
+/// thread. 1 = running, 2 = finished OK (login: hkey in `wasm_last_result_*`),
+/// a negative code = finished with an error (message in `wasm_last_error_*`).
+/// -100 specifically means the server requires a full up/download, which this
+/// pass does not perform.
+static SYNC_STATE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+const SYNC_STATE_RUNNING: i32 = 1;
+const SYNC_STATE_DONE_OK: i32 = 2;
+const SYNC_ERR_GENERIC: i32 = -1;
+const SYNC_ERR_FULL_SYNC_REQUIRED: i32 = -100;
+
+/// Drive an async rslib future to completion on the current (worker) thread.
+/// A current-thread runtime is the established way to run rslib's async API
+/// synchronously; our transport does its blocking `emscripten_fetch` inline
+/// when polled, so no multi-threaded scheduler or I/O driver is needed.
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("build current-thread tokio runtime")
+        .block_on(fut)
+}
+
+/// Normalises a user-entered sync endpoint into a `reqwest::Url`. Accepts a
+/// plain `http://host:port` (a self-hosted anki-sync-server may well be plain
+/// HTTP, not HTTPS) and guarantees a trailing slash, since rslib joins the
+/// protocol path onto this base and a missing trailing slash would drop the
+/// last segment. An empty string yields `None` → official AnkiWeb
+/// (`HttpSyncClient::new` resolves `None` to `https://sync.ankiweb.net/`).
+fn parse_endpoint(raw: &str) -> Result<Option<Url>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let with_slash = if trimmed.ends_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}/")
+    };
+    Url::parse(&with_slash)
+        .map(Some)
+        .map_err(|e| format!("invalid sync endpoint '{raw}': {e}"))
+}
+
+/// Reads a UTF-8 string from a `(ptr, len)` pair (or `""` when `len == 0`).
 ///
 /// # Safety
-/// `endpoint_ptr`/`endpoint_len` and `token_ptr`/`token_len` must each
-/// describe a valid, readable byte slice (or `len == 0`, in which case `ptr`
-/// is not read).
+/// `ptr`/`len` must describe a valid, readable byte slice, or `len == 0`.
+unsafe fn str_from_raw(ptr: *const u8, len: usize) -> Result<String, std::str::Utf8Error> {
+    if len == 0 {
+        return Ok(String::new());
+    }
+    std::str::from_utf8(std::slice::from_raw_parts(ptr, len)).map(str::to_string)
+}
+
+/// Poll the in-flight sync started by `wasm_sync_login`/`wasm_sync_collection`.
+/// Returns 1 while running, 2 on success, or a negative error code when done
+/// (see `SYNC_STATE`). 0 means no sync has been started.
 #[no_mangle]
-pub unsafe extern "C" fn wasm_sync_with_server(
+pub extern "C" fn wasm_sync_poll() -> i32 {
+    SYNC_STATE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Begin a sync **login**: exchanges username/password for a sync key (hkey)
+/// against `endpoint` (empty → official AnkiWeb). Returns 0 once the background
+/// login has been started (negative only on a bad argument); JS then polls
+/// `wasm_sync_poll` until it is 2 (hkey in `wasm_last_result_*`) or negative
+/// (message in `wasm_last_error_*`).
+///
+/// # Safety
+/// Each `(ptr, len)` pair must describe a valid, readable byte slice (or
+/// `len == 0`).
+#[no_mangle]
+pub unsafe extern "C" fn wasm_sync_login(
+    username_ptr: *const u8,
+    username_len: usize,
+    password_ptr: *const u8,
+    password_len: usize,
     endpoint_ptr: *const u8,
     endpoint_len: usize,
-    token_ptr: *const u8,
-    token_len: usize,
 ) -> i32 {
-    let _ = (endpoint_ptr, endpoint_len, token_ptr, token_len);
-    // Touch BACKEND so it isn't dead code once init_backend is wired up.
-    let _ = BACKEND.get();
-    set_last_error(
-        "sync_with_server: not yet implemented — see docs/ARCHITECTURE.md \
-         (needs a fetch()-based transport shim to replace reqwest's native path).",
-    );
-    -1
+    let username = match str_from_raw(username_ptr, username_len) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+    let password = match str_from_raw(password_ptr, password_len) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+    let endpoint = match str_from_raw(endpoint_ptr, endpoint_len) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+    // Validate the endpoint on the calling thread so an obviously bad URL is
+    // reported synchronously; `sync_login` re-parses it internally anyway.
+    let endpoint_opt = match parse_endpoint(&endpoint) {
+        Ok(e) => e.map(|u| u.to_string()),
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+
+    SYNC_STATE.store(SYNC_STATE_RUNNING, std::sync::atomic::Ordering::SeqCst);
+    std::thread::spawn(move || {
+        let result = block_on(sync_login(
+            username,
+            password,
+            endpoint_opt,
+            build_sync_http_client(),
+        ));
+        match result {
+            Ok(auth) => {
+                set_last_result(auth.hkey.into_bytes());
+                SYNC_STATE.store(SYNC_STATE_DONE_OK, std::sync::atomic::Ordering::SeqCst);
+            }
+            Err(e) => {
+                // `AnkiError`'s derived `Display` (via snafu, no explicit
+                // `#[snafu(display(...))]` on most variants) prints just the
+                // bare variant name (e.g. "SyncError") — `Debug` recurses into
+                // the nested source (network/HTTP status/context), which is
+                // far more useful for diagnosing a real sync failure against a
+                // real server than the terser `Display`.
+                set_last_error(format!("{e:?}"));
+                SYNC_STATE.store(SYNC_ERR_GENERIC, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    });
+    0
+}
+
+/// Begin a normal **collection sync** using a previously obtained `hkey`
+/// against `endpoint` (empty → official AnkiWeb). Returns 0 once the background
+/// sync has been started (negative only on a bad argument); JS then polls
+/// `wasm_sync_poll` until 2 (success — persist the collection afterwards) or a
+/// negative error code (`-100` = server requires a full up/download, which is
+/// out of scope for this pass; other negatives = message in
+/// `wasm_last_error_*`).
+///
+/// # Safety
+/// Each `(ptr, len)` pair must describe a valid, readable byte slice (or
+/// `len == 0`).
+#[no_mangle]
+pub unsafe extern "C" fn wasm_sync_collection(
+    hkey_ptr: *const u8,
+    hkey_len: usize,
+    endpoint_ptr: *const u8,
+    endpoint_len: usize,
+) -> i32 {
+    let hkey = match str_from_raw(hkey_ptr, hkey_len) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+    let endpoint = match str_from_raw(endpoint_ptr, endpoint_len) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+    let endpoint_opt = match parse_endpoint(&endpoint) {
+        Ok(e) => e,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+
+    SYNC_STATE.store(SYNC_STATE_RUNNING, std::sync::atomic::Ordering::SeqCst);
+    std::thread::spawn(move || {
+        let auth = SyncAuth {
+            hkey,
+            endpoint: endpoint_opt,
+            io_timeout_secs: None,
+        };
+        // Hold the collection lock for the whole sync — nothing else touches
+        // the collection while a sync is in flight (the main thread only polls).
+        let mut guard = match collection_slot().lock() {
+            Ok(g) => g,
+            Err(_) => {
+                set_last_error("internal lock poisoned");
+                SYNC_STATE.store(SYNC_ERR_GENERIC, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+        };
+        let col = match guard.as_mut() {
+            Some(c) => c,
+            None => {
+                set_last_error("no collection open; call wasm_open_collection first");
+                SYNC_STATE.store(SYNC_ERR_GENERIC, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+        };
+
+        let server = HttpSyncClient::new(auth, build_sync_http_client());
+        let result = block_on(NormalSyncer::new(col, server).sync());
+        match result {
+            Ok(output) => match output.required {
+                // NoChanges, or a normal sync that ran and left the collection
+                // in sync — both are success.
+                SyncActionRequired::NoChanges | SyncActionRequired::NormalSyncRequired => {
+                    SYNC_STATE.store(SYNC_STATE_DONE_OK, std::sync::atomic::Ordering::SeqCst);
+                }
+                SyncActionRequired::FullSyncRequired { .. } => {
+                    set_last_error(
+                        "server requires a full upload/download; full sync is not yet \
+                         supported in this build (use Anki desktop for the first full sync)",
+                    );
+                    SYNC_STATE
+                        .store(SYNC_ERR_FULL_SYNC_REQUIRED, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+            Err(e) => {
+                // See the matching comment in `wasm_sync_login`: `Debug`
+                // surfaces the nested error detail that `Display` collapses
+                // to just the bare variant name.
+                set_last_error(format!("{e:?}"));
+                SYNC_STATE.store(SYNC_ERR_GENERIC, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    });
+    0
 }
 
 fn main() {

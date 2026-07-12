@@ -64,10 +64,6 @@ export interface CardContent {
   css: string
 }
 
-/** Result of a sync attempt. `sync_with_server` is still a stub on the Rust
- * side (see docs/ARCHITECTURE.md §3/§6) — every call currently throws. */
-export type SyncResult = never
-
 /** A deck as returned by `listDecks` — `id` is a `bigint` because deck ids
  * are i64 creation-timestamps that can exceed `Number.MAX_SAFE_INTEGER`'s
  * exact range; `wasm_list_decks` deliberately encodes them as JSON strings
@@ -149,6 +145,7 @@ interface EmscriptenModule {
   _wasm_list_decks(): number
   _wasm_get_deck_tree(): number
   _wasm_get_stats(): number
+  _wasm_reset_progress(): number
   // `deck_id` is a genuine i64 parameter, not just an i64 return — confirmed
   // empirically (not just assumed) that -sWASM_BIGINT=1 marshals i64
   // *parameters* as native JS BigInt too, the same as it does for
@@ -166,12 +163,16 @@ interface EmscriptenModule {
   _wasm_get_next_card(): bigint
   _wasm_render_current_card(): number
   _wasm_answer_card(ease: number): number
-  _wasm_sync_with_server(
+  _wasm_sync_login(
+    usernamePtr: number,
+    usernameLen: number,
+    passwordPtr: number,
+    passwordLen: number,
     endpointPtr: number,
     endpointLen: number,
-    tokenPtr: number,
-    tokenLen: number,
   ): number
+  _wasm_sync_collection(hkeyPtr: number, hkeyLen: number, endpointPtr: number, endpointLen: number): number
+  _wasm_sync_poll(): number
 }
 
 type EmscriptenModuleFactory = (
@@ -452,6 +453,21 @@ export async function getStats(): Promise<Stats> {
 }
 
 /**
+ * Resets every card back to "new" and deletes all review history, keeping
+ * every imported deck/note/card — see `wasm_reset_progress`'s doc comment in
+ * rust/wasm-bridge/src/main.rs for exactly what this does and doesn't touch.
+ * Callers must still `persistCollection()` afterward, same as every other
+ * mutating call in this app.
+ */
+export async function resetProgress(): Promise<void> {
+  const mod = await loadModule()
+  const rc = mod._wasm_reset_progress()
+  if (rc !== 0) {
+    throw new Error(`wasm_reset_progress failed (${rc}): ${readLastError(mod)}`)
+  }
+}
+
+/**
  * Selects which deck `getNextCard`'s queue-building is scoped to. Without
  * ever calling this, the bridge silently studies whatever deck the
  * collection's `curDeck` config happens to point at (the built-in "Default"
@@ -564,19 +580,120 @@ export async function answerCard(ease: number): Promise<void> {
   }
 }
 
-export async function syncWithServer(endpoint: string, token: string): Promise<SyncResult> {
+/**
+ * Thrown by `syncCollection` when the server reports the collection needs a
+ * full upload/download rather than an incremental sync (e.g. the very first
+ * sync of a fresh collection, or after a schema-breaking change) — rslib's
+ * `SyncActionRequired::FullSyncRequired`. Full sync is deliberately out of
+ * scope for this pass (see rust/wasm-bridge/src/main.rs `wasm_sync_collection`,
+ * docs/ARCHITECTURE.md §20); distinguishing this from a generic `Error` lets
+ * the UI show an actionable message instead of a raw status code.
+ */
+export class FullSyncRequiredError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'FullSyncRequiredError'
+  }
+}
+
+/** How often to re-check `wasm_sync_poll` while a login/sync runs on the
+ * bridge's background thread. A sync round-trip is a real network operation
+ * (tens to hundreds of ms at best), so this is plenty responsive without
+ * busy-waiting. */
+const SYNC_POLL_INTERVAL_MS = 100
+
+/**
+ * Awaits the in-flight sync started by `wasm_sync_login`/`wasm_sync_collection`
+ * — see the doc comment atop those bridge exports (rust/wasm-bridge/src/main.rs)
+ * for why this must be a poll rather than the wasm call itself blocking:
+ * the actual HTTP I/O runs synchronously on a background thread inside the
+ * bridge (Emscripten's `emscripten_fetch` in its synchronous mode), so the
+ * `wasm_sync_*` entry points return immediately and JS polls to avoid
+ * blocking the browser's main thread.
+ */
+async function pollSyncUntilDone(mod: EmscriptenModule): Promise<void> {
+  for (;;) {
+    const state = mod._wasm_sync_poll()
+    if (state === 2) return
+    if (state === 1) {
+      await new Promise((resolve) => setTimeout(resolve, SYNC_POLL_INTERVAL_MS))
+      continue
+    }
+    if (state === -100) {
+      throw new FullSyncRequiredError(
+        `server requires a full upload/download (not yet supported in this build): ${readLastError(mod)}`,
+      )
+    }
+    throw new Error(`sync failed (${state}): ${readLastError(mod)}`)
+  }
+}
+
+/**
+ * Logs in to a sync server and returns the resulting sync key ("hkey") —
+ * rslib's real `anki::sync::login::sync_login`. `endpoint` empty/blank means
+ * official AnkiWeb; a non-empty URL (`http://` or `https://`) targets a
+ * self-hosted `anki-sync-server` instead — both are genuinely supported (see
+ * rust/wasm-bridge/src/main.rs `wasm_sync_login`'s `parse_endpoint`). The
+ * caller is responsible for persisting the returned hkey (this module has no
+ * session concept of its own) for later `syncCollection` calls.
+ */
+export async function syncLogin(
+  username: string,
+  password: string,
+  endpoint: string,
+): Promise<string> {
   const mod = await loadModule()
   const encoder = new TextEncoder()
+  const usernameBytes = encoder.encode(username)
+  const passwordBytes = encoder.encode(password)
   const endpointBytes = encoder.encode(endpoint)
-  const tokenBytes = encoder.encode(token)
 
-  const rc = withWasmBuffer(mod, endpointBytes, (endpointPtr, endpointLen) =>
-    withWasmBuffer(mod, tokenBytes, (tokenPtr, tokenLen) =>
-      mod._wasm_sync_with_server(endpointPtr, endpointLen, tokenPtr, tokenLen),
+  const rc = withWasmBuffer(mod, usernameBytes, (usernamePtr, usernameLen) =>
+    withWasmBuffer(mod, passwordBytes, (passwordPtr, passwordLen) =>
+      withWasmBuffer(mod, endpointBytes, (endpointPtr, endpointLen) =>
+        mod._wasm_sync_login(
+          usernamePtr,
+          usernameLen,
+          passwordPtr,
+          passwordLen,
+          endpointPtr,
+          endpointLen,
+        ),
+      ),
     ),
   )
-  // Still a stub on the Rust side — this always throws today. Kept as a real
-  // exception (not a resolved "not implemented" value) so a caller can't
-  // mistake it for success.
-  throw new Error(`wasm_sync_with_server failed (${rc}): ${readLastError(mod)}`)
+  if (rc !== 0) {
+    throw new Error(`wasm_sync_login failed to start (${rc}): ${readLastError(mod)}`)
+  }
+  await pollSyncUntilDone(mod)
+  return readLastResult(mod)
+}
+
+/**
+ * Runs a real normal sync (rslib's `NormalSyncer::sync`, unmodified sync
+ * protocol logic) against `endpoint` (empty → official AnkiWeb) using a
+ * previously obtained `hkey` (see `syncLogin`). Resolves once the sync
+ * completes with no remote changes or a successful incremental sync; throws
+ * `FullSyncRequiredError` if the server demands a full upload/download
+ * (unsupported here — use Anki desktop for the collection's first full sync),
+ * or a plain `Error` for any other failure (auth expired, network error,
+ * sanity-check mismatch, etc). A sync can change local cards/notes/decks just
+ * like an import or an answer does, so callers must still call
+ * `persistCollection()` afterwards.
+ */
+export async function syncCollection(hkey: string, endpoint: string): Promise<void> {
+  const mod = await loadModule()
+  const encoder = new TextEncoder()
+  const hkeyBytes = encoder.encode(hkey)
+  const endpointBytes = encoder.encode(endpoint)
+
+  const rc = withWasmBuffer(mod, hkeyBytes, (hkeyPtr, hkeyLen) =>
+    withWasmBuffer(mod, endpointBytes, (endpointPtr, endpointLen) =>
+      mod._wasm_sync_collection(hkeyPtr, hkeyLen, endpointPtr, endpointLen),
+    ),
+  )
+  if (rc !== 0) {
+    throw new Error(`wasm_sync_collection failed to start (${rc}): ${readLastError(mod)}`)
+  }
+  await pollSyncUntilDone(mod)
 }

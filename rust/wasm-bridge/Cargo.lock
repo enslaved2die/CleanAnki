@@ -146,7 +146,9 @@ version = "0.1.0"
 dependencies = [
  "anki",
  "anki_proto",
+ "reqwest",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

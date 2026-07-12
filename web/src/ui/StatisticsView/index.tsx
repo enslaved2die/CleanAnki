@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { motion } from 'framer-motion'
-import { getStats, type Stats } from '../../wasm/backend'
-import { ensureCollectionReady } from '../../db/collection'
+import { getStats, resetProgress, type Stats } from '../../wasm/backend'
+import { ensureCollectionReady, persistCollection } from '../../db/collection'
 
 type Status = 'loading' | 'ready' | 'error'
+type ResetStatus = 'idle' | 'resetting'
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
@@ -48,6 +49,7 @@ export default function StatisticsView() {
   const [status, setStatus] = useState<Status>('loading')
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const [stats, setStats] = useState<Stats | null>(null)
+  const [resetStatus, setResetStatus] = useState<ResetStatus>('idle')
   const bootstrapped = useRef(false)
 
   const refresh = useCallback(async () => {
@@ -69,6 +71,28 @@ export default function StatisticsView() {
         setStatus('error')
       }
     })()
+  }, [refresh])
+
+  const handleReset = useCallback(async () => {
+    // Destructive and irreversible (no undo across a reload — OPFS gets
+    // overwritten by the very next persistCollection()), same confirm
+    // pattern as HomeView's delete-deck.
+    const ok = window.confirm(
+      'Reset all progress and stats? Every card goes back to "new" and all review history is deleted. Decks, notes, and cards themselves are kept. This cannot be undone.',
+    )
+    if (!ok) return
+
+    setResetStatus('resetting')
+    try {
+      await resetProgress()
+      await persistCollection()
+      await refresh()
+      setResetStatus('idle')
+    } catch (err) {
+      setErrorMsg(errorMessage(err))
+      setStatus('error')
+      setResetStatus('idle')
+    }
   }, [refresh])
 
   return (
@@ -152,6 +176,21 @@ export default function StatisticsView() {
               />
               <StatCard label="Suspended/buried" value={stats.cardCounts.suspended + stats.cardCounts.buried} />
             </div>
+          </div>
+
+          <div className="border-t border-neutral-200 pt-6 dark:border-neutral-800">
+            <button
+              type="button"
+              onClick={handleReset}
+              disabled={resetStatus === 'resetting'}
+              className="rounded-lg bg-red-50 px-4 py-2 text-sm font-medium text-red-700 transition-colors hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-red-950/50 dark:text-red-300 dark:hover:bg-red-950"
+            >
+              {resetStatus === 'resetting' ? 'Resetting…' : 'Reset all progress and stats'}
+            </button>
+            <p className="mt-1.5 text-xs text-neutral-500 dark:text-neutral-400">
+              Every card goes back to "new" and all review history is deleted. Decks, notes, and
+              cards are kept.
+            </p>
           </div>
         </>
       )}

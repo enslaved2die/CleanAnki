@@ -26,6 +26,21 @@ path = "src/main.rs"
 # result rather than hand-rolling JSON string escaping ourselves.
 serde_json = "1"
 
+# Sync exports (`wasm_sync_login`/`wasm_sync_collection`) build a `SyncAuth` /
+# `HttpSyncClient` and construct a `reqwest::Client` for rslib's sync API. Only
+# the request *builder* (method/url/headers) is used from reqwest — the actual
+# HTTP I/O bypasses reqwest's wasm `.send()` (which needs wasm-bindgen glue this
+# build never produces) in favour of Emscripten's native `emscripten_fetch`
+# (see the io_monitor.rs patch and docs/ARCHITECTURE.md §17/§20). Same
+# version/features as anki's workspace so cargo unifies to one compile.
+reqwest = { version = "0.12.20", default-features = false }
+
+# A current-thread tokio runtime drives rslib's async sync API to completion on
+# the background worker thread the sync exports spawn. `rt` is already enabled
+# transitively by rslib (rt-multi-thread); declared here so this crate can name
+# `tokio::runtime::Builder` directly.
+tokio = { version = "1.45", default-features = false, features = ["rt"] }
+
 # --- The real Anki backend --------------------------------------------------
 # The crate living in the `rslib/` directory is actually named `anki` (the dir
 # is "rslib", the [package] name is "anki"), so we must alias it via `package`.

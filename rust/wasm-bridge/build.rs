@@ -65,13 +65,16 @@ fn main() {
         "_wasm_delete_deck",
         "_wasm_get_deck_tree",
         "_wasm_get_stats",
+        "_wasm_reset_progress",
         "_wasm_list_media_files",
         "_wasm_read_media_file",
         "_wasm_write_media_file",
         "_wasm_get_next_card",
         "_wasm_render_current_card",
         "_wasm_answer_card",
-        "_wasm_sync_with_server",
+        "_wasm_sync_login",
+        "_wasm_sync_collection",
+        "_wasm_sync_poll",
     ];
     let list = exported_functions
         .iter()
@@ -115,4 +118,11 @@ fn main() {
     // by bumping the stack; 4MB is generous headroom over whatever the real
     // minimum is — untuned, deliberately not cutting it close.
     println!("cargo:rustc-link-arg=-sSTACK_SIZE=4194304");
+
+    // Link Emscripten's native `emscripten_fetch` HTTP implementation
+    // (system/lib/fetch). This is the transport used by the sync exports:
+    // reqwest's own wasm `.send()` needs wasm-bindgen JS glue this build never
+    // produces (see docs/ARCHITECTURE.md §17), so all sync HTTP I/O goes
+    // through synchronous `emscripten_fetch` on a background pthread instead.
+    println!("cargo:rustc-link-arg=-sFETCH=1");
 }

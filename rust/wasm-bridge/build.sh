@@ -128,6 +128,50 @@ cargo +nightly build \
   --target "${TARGET}" \
   "${BUILD_STD_ARGS[@]}"
 
+# --- 3. Post-build patch: emscripten_fetch's JS glue can't POST a body from a
+# SharedArrayBuffer-backed heap --------------------------------------------
+#
+# 2026-07-12 (real sync transport, docs/ARCHITECTURE.md §20): confirmed live
+# in a real browser — `emscripten_fetch`'s generated `fetchXHR()` (from
+# `-sFETCH=1`) does `xhr.send(HEAPU8.subarray(dataPtr, dataPtr + dataLength))`
+# for a request with a body, and that subarray is a view over our wasm
+# memory's backing `SharedArrayBuffer` (mandatory for pthreads, which
+# `-pthread -sUSE_PTHREADS=1` already requires). Browsers reject sending a
+# SharedArrayBuffer-backed view directly:
+#   "Failed to execute 'send' on 'XMLHttpRequest': The provided
+#    ArrayBufferView value must not be shared."
+# — this is the exact same class of bug already hit and fixed for
+# `TextDecoder.decode()` on the read side (see web/src/wasm/backend.ts
+# `readLastError`/`readLastResult`, docs/ARCHITECTURE.md §8.2): anything that
+# hands a live wasm-memory view to a browser API that specifically rejects
+# `SharedArrayBuffer` needs a plain, non-shared *copy* first.
+# `TypedArray.prototype.slice()` does exactly that (returns a fresh,
+# non-shared `ArrayBuffer`-backed copy), and only this one call site in the
+# whole glue (`xhr.send(data)`, from `emscripten_fetch`'s bundled
+# `library_fetch.js`) needs it — GET/bodyless requests pass `data = null`,
+# unaffected. Patching emcc's generated output directly (rather than
+# upstream) because there is no user-facing flag for this; it's a one-line,
+# easily-re-verified `sed`, run fresh on every build so it can never silently
+# go stale against a different emcc version.
+GLUE_JS="${CRATE_DIR}/target/${TARGET}/release/anki_wasm_bridge.js"
+if [ -f "${GLUE_JS}" ]; then
+  echo "==> patching emscripten_fetch glue: xhr.send(data) -> copy out of SharedArrayBuffer first"
+  BEFORE_COUNT=$(grep -o 'xhr\.send(data)' "${GLUE_JS}" | wc -l | tr -d ' ')
+  if [ "${BEFORE_COUNT}" != "1" ]; then
+    echo "ERROR: expected exactly 1 occurrence of 'xhr.send(data)' in ${GLUE_JS}, found ${BEFORE_COUNT}."
+    echo "       emcc's generated glue likely changed shape (different emscripten version?)."
+    echo "       Re-derive the patch by hand before proceeding — see the comment above this block."
+    exit 1
+  fi
+  sed -i.bak 's/xhr\.send(data)/xhr.send(data?data.slice():data)/' "${GLUE_JS}"
+  rm -f "${GLUE_JS}.bak"
+  AFTER_COUNT=$(grep -o 'xhr\.send(data?data\.slice():data)' "${GLUE_JS}" | wc -l | tr -d ' ')
+  if [ "${AFTER_COUNT}" != "1" ]; then
+    echo "ERROR: post-patch verification failed (expected 1 patched occurrence, found ${AFTER_COUNT})."
+    exit 1
+  fi
+fi
+
 echo
 echo "Build finished. Artifacts (if produced):"
 ls -la "${CRATE_DIR}/target/${TARGET}/release/"anki_wasm_bridge.* 2>/dev/null || true

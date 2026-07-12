@@ -1631,3 +1631,232 @@ cards..." (83% correct), `Scheduling algorithm: FSRS` (confirming §18), due
 counts, and card-count breakdown (14996 new, 4 in learning) — all real
 numbers matching what had actually happened in this session, not placeholder
 data. Full test suite passes (33/33), typecheck clean, fresh wasm build clean.
+
+## 20. 2026-07-12 — Real sync, unblocked: `emscripten_fetch` replaces reqwest's `.send()`
+
+§17 stopped at a confirmed hard `LinkError`: reqwest's wasm `.send()` needs
+wasm-bindgen JS glue this Emscripten-only build never produces. The fix
+picked up here, per the plan proposed at the end of §17: keep reqwest only to
+*build* the request (method/url/headers — proven safe already), and perform
+the actual HTTP I/O with Emscripten's own native `emscripten_fetch` C API in
+its synchronous mode, from a background `std::thread` (a real Web Worker
+under `wasm32-unknown-emscripten`, backed by the pthreads support this build
+already has working for tokio/rayon).
+
+### 20.1 Derisking, done first and reported honestly before building further
+
+Added a throwaway export (`wasm_test_fetch_start`/`_poll`, since removed) that
+spawned a `std::thread` and called synchronous `emscripten_fetch` against a
+real reachable URL, reporting status via a poll (never `.join()` — blocking
+join from the main thread itself hit Emscripten's `unwind` abort; the main
+thread must never block on a worker, only start it and poll). Node could not
+complete this test (`XMLHttpRequest is not defined` — Node has no XHR, and
+`emscripten_fetch`'s sync path is XHR-based), so this was verified for real
+in an actual browser: an isolated static server (its own port, own origin,
+COOP/COEP headers, no relation to the app's `:5173` origin/OPFS bucket) using
+`preview_start`/`preview_eval`. Result: `crossOriginIsolated=true`,
+`SharedArrayBuffer` available, and a GET to `https://httpbin.org/get` returned
+a genuine HTTP 200 with the real response body — proof that
+`std::thread::spawn` produces a real, schedulable worker under this target,
+and synchronous `emscripten_fetch` really dispatches network I/O from it.
+This derisking used a *separate* Node process and a *separate* browser tab
+the whole time; it never touched the user's real `:5173` session or its OPFS
+data.
+
+### 20.2 Transport: `IoMonitor::zstd_request_with_timeout`'s wasm branch (vendored patch)
+
+`rust/vendor/anki/rslib/src/sync/http_client/io_monitor.rs` — replaced the
+`#[cfg(target_family = "wasm")]` stub (always `NOT_IMPLEMENTED`) with a real
+implementation:
+
+1. `request.header(CONTENT_TYPE, ...).build()` — extracts method/url/headers
+   from the `RequestBuilder` (pure Rust, no wasm-bindgen involvement).
+2. `zstd::encode_all(request_body, 0)` — one-shot compression (anki already
+   depends on `zstd` directly elsewhere, e.g. `colpkg/export.rs`), wire-
+   compatible with the server's streaming `async_compression` zstd (still
+   standard zstd frames either way).
+3. A hand-written `#[repr(C)]` FFI module (`emfetch`, field-for-field matching
+   `emscripten/fetch.h` — verified byte-for-byte against the actual generated
+   JS glue's hardcoded struct-field byte offsets, see 20.4) builds an
+   `emscripten_fetch_attr_t` with the method, a null-terminated
+   `{key,value,...,0}` header array, the compressed body, and
+   `EMSCRIPTEN_FETCH_SYNCHRONOUS`, then calls `emscripten_fetch` — a real,
+   blocking network round-trip.
+4. `zstd::decode_all` on the response body; non-2xx or status 0 (network
+   error/timeout — XHR reports no HTTP status) becomes an `HttpError`.
+
+Deliberate simplifications vs. the non-wasm version above it in the same
+file: no incremental streaming (both bodies are handled in one shot — sync
+payloads are bounded by `MAXIMUM_SYNC_PAYLOAD_BYTES_UNCOMPRESSED` already), no
+`IoMonitor`/stall-timeout race (replaced by `emscripten_fetch`'s own
+`timeoutMSecs`, set from the caller's `stall_duration`). Everything else in
+the real sync protocol above and around this function (login, meta check, the
+full `NormalSyncer` algorithm, sanity checks) is unmodified rslib logic.
+
+**A second, real bug found and fixed empirically, not by inspection.**
+Building a request with a body and a custom header consistently failed with
+`HttpError { code: 303, context: "sync server returned HTTP 0" }` against a
+real same-origin mock server — no exception surfaced anywhere in Rust, no
+network request even visible in DevTools. Root cause, found by testing
+Emscripten's generated `fetchXHR()` JS directly: it does
+`xhr.send(HEAPU8.subarray(dataPtr, dataPtr + dataLength))`, and that subarray
+is a *view over the wasm heap's backing `SharedArrayBuffer`* (mandatory for
+pthreads). Browsers reject sending a `SharedArrayBuffer`-backed view:
+`"Failed to execute 'send' on 'XMLHttpRequest': The provided ArrayBufferView
+value must not be shared."` — confirmed by reproducing it directly with a
+bare `new SharedArrayBuffer(16)` + `xhr.send(view)` in the browser console.
+This is the *exact same bug class* already hit and fixed on the read side in
+§8.2 (`TextDecoder.decode()` rejecting the pthreads-backed heap) — anything
+that hands a live wasm-memory view to a browser API that specifically
+special-cases and rejects `SharedArrayBuffer` needs a plain, non-shared copy
+first. Fixed with a one-line, self-verifying `sed` patch applied to Emscripten's
+*generated* glue at the end of `rust/wasm-bridge/build.sh` (there is no
+upstream flag for this): `xhr.send(data)` → `xhr.send(data?data.slice():data)`
+(`TypedArray.prototype.slice()` returns a fresh, non-shared copy). The build
+script asserts the substring appears exactly once before and after patching,
+so a future emscripten version that changes this code shape fails loudly
+instead of silently no-op'ing.
+
+**Also found:** `reqwest::Client::new()` (the wasm impl) does
+`Client::builder().build().unwrap_throw()` — that one `.unwrap_throw()` (from
+`wasm_bindgen::UnwrapThrowExt`, infallible in practice here) is the *only*
+reason a wasm-bindgen `__wbindgen_throw` import was reachable from this
+binary at all, and that import cannot be satisfied (needs wasm-bindgen-CLI
+JS glue this build never produces) — it failed at *instantiation*
+("import requires a callable"), not at a call site, since wasm imports are
+resolved eagerly regardless of reachability. Fixed by never calling
+`Client::new()`: `rust/wasm-bridge/src/main.rs`'s `build_sync_http_client()`
+calls `Client::builder().build().expect(...)` instead (plain
+`Result::expect`, no wasm-bindgen involvement whatsoever) — with nothing left
+referencing `Client::new()`'s body, `lto = true` (already set in this crate's
+release profile) drops it entirely, and the import requirement disappears
+with it. Confirmed empirically: this is what took the link from one
+undefined-import instantiation failure to a clean, zero-undefined-symbol
+build.
+
+Regenerated `rust/vendor-patches/anki-26.05.patch` afterwards (`cd
+rust/vendor/anki && git diff > ../../vendor-patches/anki-26.05.patch`,
+capturing this change cumulatively with every prior patch).
+
+### 20.3 New bridge exports (`rust/wasm-bridge/src/main.rs`)
+
+Both new exports *start* their work on a spawned `std::thread` and return
+immediately (0, or negative only for a bad argument) — the browser's main
+thread must never block on `emscripten_fetch`'s synchronous mode, so JS polls
+`wasm_sync_poll()` (1 = running, 2 = done OK, negative = error/`-100` = full
+sync required) rather than the wasm call itself blocking:
+
+- `wasm_sync_login(username, password, endpoint)` — calls
+  `anki::sync::login::sync_login`. On success, the returned `hkey` is written
+  via `wasm_last_result_ptr/len`.
+- `wasm_sync_collection(hkey, endpoint)` — builds `SyncAuth { hkey, endpoint,
+  io_timeout_secs: None }` and an `HttpSyncClient`, then runs
+  `NormalSyncer::new(&mut col, server).sync()` on a `tokio::runtime::Builder
+  ::new_current_thread()` (the established pattern for driving async rslib
+  code to completion from sync-shaped code — the transport's own blocking
+  `emscripten_fetch` call happens inline when the future is polled, on the
+  same worker thread, so no further thread hop is needed inside the sync
+  itself). `SyncActionRequired::NoChanges`/`NormalSyncRequired` → success;
+  `FullSyncRequired` → a distinct `-100` error code (full upload/download is
+  out of scope for this pass — the error message tells the user to do their
+  first full sync from Anki desktop).
+- Both endpoints (empty string) resolve to official AnkiWeb, or accept a
+  self-hosted server URL — including plain `http://`, not just `https://`,
+  per a real user requirement (`parse_endpoint` normalises/validates the URL
+  and adds a trailing slash rslib's endpoint-joining logic needs).
+- Error messages from these two exports use `format!("{e:?}")` (`Debug`),
+  not the shared `set_last_error`'s usual `Display` — `AnkiError`'s derived
+  `snafu` `Display` prints just the bare variant name (e.g. `"SyncError"`)
+  for variants without an explicit format string, while `Debug` recurses
+  into the real nested detail (HTTP status, context, network error kind),
+  which is what you actually want when diagnosing a real sync failure.
+
+### 20.4 What "confirmed working" actually means here — evidence, not assumption
+
+Verified for real, against a same-origin mock sync server (Node, native
+`zlib.zstdCompressSync`/`zstdDecompressSync`) in an actual browser (isolated
+static server/origin, no relation to the app's real `:5173`/OPFS):
+`wasm_sync_login` ran end-to-end — real zstd-compressed request body, the
+custom `anki-sync` header, a real POST dispatched via synchronous
+`emscripten_fetch`, a real response received and zstd-decompressed, parsed by
+rslib's own unmodified login-protocol code into a `HostKeyResponse`, hkey
+returned correctly (`"MOCK_HKEY_12345"`, matching what the mock server sent).
+The mock server's own log confirmed the request it received: correct
+`Content-Type: application/octet-stream`, the `anki-sync` header present, a
+valid zstd-decodable body containing the exact expected JSON
+(`{"u":"testuser","p":"testpass"}`). Since `wasm_sync_collection`'s
+`NormalSyncer::sync()` funnels through this exact same transport function for
+every protocol step (meta/start/apply_changes/chunk/apply_chunk/sanity_check/
+finish), this is direct evidence the transport itself — the only genuinely
+new code in this session — works correctly, not just that it compiles.
+
+**What remains unverified** (the orchestrating session/user should check
+against the real server): the full `NormalSyncer` protocol exchange end to
+end against `anki-sync-server` specifically (not the shallow mock above), and
+anything server-specific about the user's own self-hosted instance
+(`http://192.168.178.4:8081/`, per the user — unreachable from this sandbox,
+and the user mentioned they haven't yet confirmed that server works with
+real Anki desktop either, so a failure there may not indicate a bug in this
+implementation at all). `FullSyncRequired` handling is implemented but its
+error path (not just its happy path) was not exercised against a real
+server. Auth failure / expired-hkey / network-down error surfacing is
+implemented (falls through to the generic `Debug`-formatted error) but not
+exercised against a real unreachable/rejecting server from this sandbox.
+
+### 20.5 Web app (`web/src/wasm/backend.ts`, `web/src/ui/SyncSettings/index.tsx`)
+
+`backend.ts`: replaced the permanently-throwing `syncWithServer` stub with
+`syncLogin(username, password, endpoint)` and `syncCollection(hkey,
+endpoint)`, both `async` wrappers around the alloc/write/call/dealloc pattern
+already used everywhere else in this file, plus a shared `pollSyncUntilDone`
+helper (100ms interval) matching the bridge's start-then-poll shape. A new
+`FullSyncRequiredError` class lets the UI distinguish "needs a full sync"
+from a generic failure.
+
+`SyncSettings`: real username/password fields, a "Use custom sync server"
+checkbox that reveals an endpoint input (unchecked = official AnkiWeb,
+matching real Anki desktop's own preferences screen), "Log in" →
+`syncLogin`, "Sync now" → `syncCollection` then `persistCollection()` (same
+mutate → persist pattern as every other flow in this app — a sync can change
+local cards/notes/decks just like an import). The hkey is stored in
+`localStorage` (a long-lived credential-like token, not collection data — it
+doesn't belong in OPFS alongside the collection itself, and there is no
+server-side session to invalidate from this UI; "Log out" just forgets the
+local copy). Verified in the real browser: the Sync tab renders the new
+form, the custom-server checkbox correctly reveals/hides the endpoint field,
+no console errors — login/sync itself could not be exercised against a real
+server from this sandbox (see 20.4).
+
+### 20.6 Test/build status
+
+Full web test suite passes (33/33), `tsc --noEmit` clean, fresh
+`bash rust/wasm-bridge/build.sh` clean (zero undefined symbols — down from an
+initial single missing wasm-bindgen import, resolved per 20.2), artifacts
+synced via `web/scripts/sync-wasm-artifacts.sh`. All throwaway derisking code
+(the Step-0 test export, the isolated Node test server, the temporary
+`launch.json` entry) was removed; only the real transport, bridge exports,
+and UI changes remain.
+
+### 20.7 Found during review: a real (if narrow) crash risk, fixed
+
+`wasm_sync_collection` holds the bridge's single `collection_slot()` mutex on
+its background worker thread for the sync's *entire* duration (it has to —
+`NormalSyncer` needs `&mut Collection` throughout). Every other bridge call
+that touches the collection (`getDeckTree`, `getNextCard`, `answerCard`, ...)
+runs synchronously on the browser's main thread and blocks on that same
+mutex if it's held. Rust's `Mutex::lock` under Emscripten's pthread emulation
+blocks via `Atomics.wait`, which browsers refuse to allow on the main
+thread — so a user switching to Home/Study/Import while a sync is still in
+flight wouldn't just stall, it risked a hard crash the moment that view's own
+bootstrap call tried to acquire the lock. This is exactly the kind of thing
+easy to miss end-to-end (it never triggers in a quick same-tab test; it needs
+someone to actually click away mid-sync), so it's called out here rather than
+left to be discovered later.
+
+Fixed at the UI layer rather than the bridge, since serializing this in Rust
+would need a redesign of the single-collection-lock model for one narrow
+case: `SyncSettings` now takes an `onBusyChange` callback, firing `true` for
+the duration of a login or sync and `false` when it settles (success or
+error). `App.tsx` disables every other tab's button while any sync is
+busy — `setView` is never called for a disabled tab, so the scenario can no
+longer happen. `web/src/App.tsx`, `web/src/ui/SyncSettings/index.tsx`.

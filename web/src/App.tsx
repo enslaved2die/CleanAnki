@@ -18,6 +18,13 @@ const tabs: { id: View; label: string }[] = [
 
 function App() {
   const [view, setView] = useState<View>('home')
+  // A login/sync holds the wasm bridge's collection lock on a background
+  // thread for its whole duration (see SyncSettings' `onBusyChange` doc
+  // comment) — navigating to another tab mid-sync would fire that tab's own
+  // bridge call on the main thread and risk a hard crash, not just a stall.
+  // Disabled tabs (rather than blocking `setView` itself) keeps this visible
+  // to the user instead of a silent no-op click.
+  const [syncBusy, setSyncBusy] = useState(false)
 
   return (
     <div className="min-h-svh bg-neutral-50 text-neutral-900 dark:bg-neutral-950 dark:text-neutral-100">
@@ -37,7 +44,9 @@ function App() {
               key={tab.id}
               type="button"
               onClick={() => setView(tab.id)}
-              className={`relative rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
+              disabled={syncBusy && tab.id !== 'sync'}
+              title={syncBusy && tab.id !== 'sync' ? 'A sync is in progress' : undefined}
+              className={`relative rounded-full px-4 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
                 view === tab.id
                   ? 'text-white'
                   : 'text-neutral-500 hover:text-neutral-900 dark:hover:text-white'
@@ -73,7 +82,7 @@ function App() {
             {view === 'study' && <StudyView />}
             {view === 'import' && <ImportView />}
             {view === 'stats' && <StatisticsView />}
-            {view === 'sync' && <SyncSettings />}
+            {view === 'sync' && <SyncSettings onBusyChange={setSyncBusy} />}
           </motion.div>
         </AnimatePresence>
       </main>
