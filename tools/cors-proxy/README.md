@@ -1,29 +1,36 @@
 # cors-proxy
 
 A minimal, dependency-free local reverse proxy that adds CORS headers in
-front of a self-hosted `anki-sync-server`.
+front of an Anki sync server — **official AnkiWeb included, not just
+self-hosted servers.**
 
 ## Why you need this
 
-The official `anki-sync-server` (and any self-hosted build derived from
-rslib's `http_server` module) sends no `Access-Control-Allow-*` response
-headers — it was only ever built to be called from the native Anki
-desktop/mobile clients, which don't enforce CORS. CleanAnki's sync client
-runs in a browser, and only browsers enforce CORS, so a direct request from
-CleanAnki to your self-hosted server is blocked before the app ever sees a
-response:
+The Anki sync protocol (`anki-sync-server`, any self-hosted build derived
+from rslib's `http_server` module, and — confirmed directly, not assumed —
+the real production AnkiWeb server itself) sends no `Access-Control-Allow-*`
+response headers at all. It was only ever built to be called from the native
+Anki desktop/mobile clients, which don't enforce CORS. CleanAnki's sync
+client runs in a browser, and only browsers enforce CORS, so a direct
+request to *any* Anki sync server — official or self-hosted — is blocked
+before the app ever sees a response:
 
 ```
 Cross-Origin Request Blocked: The Same Origin Policy disallows reading the
-remote resource at http://<your-server>/sync/hostKey. (Reason: CORS request
-failed). Status code: (null).
+remote resource at https://sync.ankiweb.net/sync/hostKey. (Reason: CORS
+request failed). Status code: (null).
 ```
+
+(Verified directly against `sync.ankiweb.net`: it answers a CORS preflight
+`OPTIONS` request with a bare `405 Method Not Allowed` and no CORS headers of
+any kind — it doesn't even recognise `OPTIONS` as a real request, let alone
+answer it the way a CORS-aware server would.)
 
 This is not something CleanAnki (or any browser-based Anki client) can work
 around from the client side — the server has to send the right headers, and
-it doesn't. Official AnkiWeb sync works from a browser context only because
-AnkiWeb's own infrastructure presumably handles this; a self-hosted server
-does not.
+none of them do. **This means the proxy below is needed even for official
+AnkiWeb** — just point its target at `https://sync.ankiweb.net` instead of a
+self-hosted server's address; everything else works the same way.
 
 Two ways to fix it — pick whichever you're more comfortable running. Both do
 the same thing: add the missing `Access-Control-Allow-*` headers in front of
@@ -35,8 +42,10 @@ No dependencies beyond Node itself.
 
 ```bash
 node tools/cors-proxy/proxy.mjs
-# or, to point at a different server/port:
+# or, to point at a self-hosted server:
 SYNC_SERVER=http://192.168.178.4:8081 PORT=8082 node tools/cors-proxy/proxy.mjs
+# or, to reach official AnkiWeb through the proxy instead:
+SYNC_SERVER=https://sync.ankiweb.net PORT=8082 node tools/cors-proxy/proxy.mjs
 ```
 
 Then in CleanAnki's Sync tab, check "Use custom sync server" and enter

@@ -179,18 +179,16 @@ export default function SyncSettings({
               self-hosted <code className="rounded bg-neutral-200 px-1 dark:bg-neutral-800">anki-sync-server</code>{' '}
               (plain <code className="rounded bg-neutral-200 px-1 dark:bg-neutral-800">http://</code> is fine).
             </p>
-            {useCustomServer && (
-              <p className="mt-1.5 text-xs text-neutral-500 dark:text-neutral-400">
-                A self-hosted server has no CORS support, so a browser-based client like this one
-                will fail with a "Cross-Origin Request Blocked" error unless something in front of
-                it adds CORS headers. See{' '}
-                <code className="rounded bg-neutral-200 px-1 dark:bg-neutral-800">
-                  tools/cors-proxy/README.md
-                </code>{' '}
-                for a small local proxy that does this — run it, then point this field at the
-                proxy's address instead of your server's.
-              </p>
-            )}
+            <p className="mt-2 rounded-lg bg-amber-50 p-3 text-xs text-amber-800 dark:bg-amber-950/50 dark:text-amber-200">
+              <strong>Neither AnkiWeb nor a self-hosted server can be reached directly from a
+              browser</strong> — confirmed against the real AnkiWeb server: it sends no
+              CORS headers at all (it was only ever built for the native desktop/mobile apps,
+              which don't enforce CORS). Leaving this unchecked will fail here. Run the local
+              proxy in <code className="rounded bg-amber-100 px-1 dark:bg-amber-900">tools/cors-proxy/</code>{' '}
+              (works for either target — see its README), check this box, and point it at your
+              proxy's own address (e.g. <code className="rounded bg-amber-100 px-1 dark:bg-amber-900">http://localhost:8082</code>)
+              instead of AnkiWeb's or your server's address directly.
+            </p>
           </div>
 
           {loginStatus === 'error' && loginError && (

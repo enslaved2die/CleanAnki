@@ -1915,3 +1915,51 @@ CORS error with no context.
 **Still unverified**: the proxy sitting in front of the user's actual
 `192.168.178.4:8081` server, end to end, from their own machine — that step
 needs the user to run it themselves and try again.
+
+## 22. 2026-07-12 — Correction: official AnkiWeb has the exact same CORS wall, not just self-hosted servers
+
+§21 shipped assuming (not verifying) that official AnkiWeb's own
+infrastructure must handle CORS somehow, since it's a real production
+service — only self-hosted servers were assumed to lack it. The user then
+reported the *same* CORS error switching to official AnkiWeb (unchecking
+"custom sync server"). That assumption was wrong, and worth stating plainly
+rather than glossing over: it should have been verified the first time
+instead of guessed.
+
+**Verified directly, not assumed, this time.** `sync.ankiweb.net` is a public
+host, unlike the user's LAN server, so it's reachable from this sandbox.
+`curl -X OPTIONS https://sync.ankiweb.net/sync/hostKey -H "Origin: ..." -H
+"Access-Control-Request-Method: POST" -H "Access-Control-Request-Headers:
+content-type,anki-sync"` returns a bare `405 Method Not Allowed` with zero
+`Access-Control-*` headers — AnkiWeb's real production server doesn't even
+recognise a CORS preflight `OPTIONS` request as anything other than an
+unsupported HTTP method on that route. This makes complete sense in
+hindsight: no legitimate Anki client before CleanAnki ever ran in a browser,
+so no Anki sync server — official or self-hosted — ever had a reason to
+support CORS. This is a universal property of the real Anki sync ecosystem,
+not a self-hosted-specific gap.
+
+**The fix is the same proxy, just retargeted.** `tools/cors-proxy/proxy.mjs`
+already branches on `targetUrl.protocol` (`http`/`https`), so pointing
+`SYNC_SERVER=https://sync.ankiweb.net` at it needed no code change. Verified
+for real, end to end, in the actual browser: ran the proxy pointed at
+`https://sync.ankiweb.net`, entered deliberately-bogus credentials into
+CleanAnki's Sync tab pointed at the local proxy, and got back
+`HttpError { code: 403, context: "sync server returned HTTP 403" }` — a
+genuine authentication rejection from AnkiWeb's real server, not a CORS
+block. That's direct proof the proxy clears the CORS wall for AnkiWeb too
+(a 403 means the request reached the server, was parsed, and was rejected
+for being wrong credentials — categorically different from the browser
+refusing to let JS see the response at all).
+
+**Fixed the misleading UI copy.** `SyncSettings` previously implied
+"leave unchecked" (official AnkiWeb) just works, with the CORS warning only
+shown once "use custom sync server" was checked — backwards, since the
+unchecked path is the one that's actually guaranteed to fail from this
+browser-based app. The warning is now unconditional and explicit that
+*neither* path works directly, pointing at `tools/cors-proxy/` regardless of
+which server the user is targeting.
+
+`tools/cors-proxy/README.md` updated to lead with "AnkiWeb included, not
+just self-hosted," and documents the `SYNC_SERVER=https://sync.ankiweb.net`
+invocation directly.
