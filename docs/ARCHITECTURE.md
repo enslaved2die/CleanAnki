@@ -1860,3 +1860,58 @@ the duration of a login or sync and `false` when it settles (success or
 error). `App.tsx` disables every other tab's button while any sync is
 busy — `setView` is never called for a disabled tab, so the scenario can no
 longer happen. `web/src/App.tsx`, `web/src/ui/SyncSettings/index.tsx`.
+
+## 21. 2026-07-12 — Real self-hosted server, real (structural) CORS wall
+
+The user tried the real transport against their own `anki-sync-server` at
+`http://192.168.178.4:8081` from a browser on their own LAN (this sandbox has
+no route there, so this had to be tested on the user's own machine). Real
+credentials (`ana`/`kenny123`), and this time the request actually reached
+the server — a step further than the sandbox's own attempt, which failed at
+the connection level. The browser then blocked it outright:
+
+```
+Quellübergreifende (Cross-Origin) Anfrage blockiert: Die Gleiche-Quelle-Regel
+verbietet das Lesen der externen Ressource auf
+http://192.168.178.4:8081/sync/hostKey. (Grund: CORS-Anfrage schlug fehl).
+Statuscode: (null).
+```
+
+**Root-caused, not guessed:** grepped the vendored rslib's own
+`sync/http_server` module (the code the official self-hosted server is built
+from) for any CORS handling — none exists. Cross-checked against the
+official sync-server Docker docs (`rust/vendor/anki/docs/syncserver/README.md`)
+and a web search — no CORS-related configuration exists for
+`anki-sync-server` at all (unlike the separate `AnkiConnect` add-on, which
+does have a configurable origin allowlist). This is structural: the server
+was only ever built to be called by the native Anki desktop/mobile clients,
+which don't enforce CORS — only browsers do, and CleanAnki is the first
+browser-based Anki client to ever hit this wall. Confirmed empirically too:
+`(*fetch).status == 0` and a rejected response is exactly what a browser does
+on a failed CORS check (see the `status == 0` handling already in
+`io_monitor.rs`'s wasm transport, §20.2) — nothing in *our* code is broken;
+the server simply never sends `Access-Control-Allow-Origin`, so the browser
+refuses to expose the response (status, headers, and body) to JS at all,
+regardless of whether the server actually answered correctly.
+
+**Fix: a small local CORS-adding reverse proxy**, `tools/cors-proxy/proxy.mjs`
+— dependency-free Node (built-in `http`/`https` only), configurable via
+`SYNC_SERVER`/`PORT` env vars. Forwards every request unchanged and adds
+`Access-Control-Allow-Origin` (reflecting the request's own `Origin`, so it
+works regardless of which port `vite` picks), `Access-Control-Allow-Methods`,
+and `Access-Control-Allow-Headers` (reflecting the preflight's own
+`Access-Control-Request-Headers`, so it doesn't need to hardcode the sync
+protocol's custom `anki-sync` header). Handles the `OPTIONS` preflight
+directly rather than forwarding it. Verified for real: spun up a throwaway
+plain-HTTP test server, ran the proxy in front of it, and confirmed with
+`curl` that a preflight `OPTIONS` gets the right headers back and a real
+`POST` is forwarded, logged by the test server, and returned with CORS
+headers attached — the proxy logic itself is proven, independent of the
+user's actual (unreachable-from-here) server. `SyncSettings`'s "use custom
+server" section now links to `tools/cors-proxy/README.md` directly, so a
+future self-hosted-server user hits a clear explanation instead of a bare
+CORS error with no context.
+
+**Still unverified**: the proxy sitting in front of the user's actual
+`192.168.178.4:8081` server, end to end, from their own machine — that step
+needs the user to run it themselves and try again.

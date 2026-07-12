@@ -179,6 +179,18 @@ export default function SyncSettings({
               self-hosted <code className="rounded bg-neutral-200 px-1 dark:bg-neutral-800">anki-sync-server</code>{' '}
               (plain <code className="rounded bg-neutral-200 px-1 dark:bg-neutral-800">http://</code> is fine).
             </p>
+            {useCustomServer && (
+              <p className="mt-1.5 text-xs text-neutral-500 dark:text-neutral-400">
+                A self-hosted server has no CORS support, so a browser-based client like this one
+                will fail with a "Cross-Origin Request Blocked" error unless something in front of
+                it adds CORS headers. See{' '}
+                <code className="rounded bg-neutral-200 px-1 dark:bg-neutral-800">
+                  tools/cors-proxy/README.md
+                </code>{' '}
+                for a small local proxy that does this — run it, then point this field at the
+                proxy's address instead of your server's.
+              </p>
+            )}
           </div>
 
           {loginStatus === 'error' && loginError && (
