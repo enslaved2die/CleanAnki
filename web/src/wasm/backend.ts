@@ -130,6 +130,10 @@ export interface Stats {
   dueThisWeek: number
   /** Overdue cards (were due on a previous day and haven't been studied). */
   backlog: number
+  /** Per-day due counts for the next 7 days (day 0 = today), from rslib's
+   * `future_due` forecast — the same map `dueToday`/`dueThisWeek` are summed
+   * from. Rendered as a small forecast bar chart. */
+  dueForecast: { day: number; count: number }[]
 }
 
 /** Raw shape of the object Emscripten's MODULARIZE factory resolves to.

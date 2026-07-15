@@ -771,6 +771,18 @@ pub extern "C" fn wasm_get_stats() -> i32 {
         .map(|(_, count)| *count)
         .sum();
 
+    // Per-day due counts for the next 7 days (day 0 = today), reusing the same
+    // `future_due` map the sums above already read from — no extra fetch. The
+    // UI renders this as a small forecast bar chart.
+    let due_forecast: Vec<serde_json::Value> = (0..7)
+        .map(|day| {
+            serde_json::json!({
+                "day": day,
+                "count": future_due.future_due.get(&day).copied().unwrap_or(0),
+            })
+        })
+        .collect();
+
     let payload = serde_json::json!({
         "fsrs": graphs.fsrs,
         "studiedTodayText": studied_today_text,
@@ -793,6 +805,7 @@ pub extern "C" fn wasm_get_stats() -> i32 {
         "dueToday": due_today,
         "dueThisWeek": due_this_week,
         "backlog": backlog,
+        "dueForecast": due_forecast,
     });
 
     match serde_json::to_vec(&payload) {
