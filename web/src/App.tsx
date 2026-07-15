@@ -151,7 +151,7 @@ function App() {
         className="fixed inset-x-0 bottom-4 z-20 flex justify-center px-4 pb-[env(safe-area-inset-bottom)]"
         aria-label="Primary"
       >
-        <div className="flex gap-1 rounded-full bg-white/95 p-2 shadow-lg backdrop-blur dark:bg-neutral-900/95">
+        <div className="flex gap-4 rounded-full bg-white/95 px-3 py-2 shadow-lg backdrop-blur dark:bg-neutral-900/95">
           {tabs.map((tab) => (
             <button
               key={tab.id}

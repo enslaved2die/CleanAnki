@@ -10,6 +10,20 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
+/** Cycled by deck position so cards read as distinct decks at a glance
+ * instead of a wall of identical indigo — `bg-gradient-to-br` pairs picked to
+ * stay in the same saturated, mid-dark range as the original indigo card so
+ * white text/counts stay readable in both light and dark mode without needing
+ * a separate dark-mode palette. */
+const DECK_CARD_GRADIENTS = [
+  'from-indigo-500 to-violet-600',
+  'from-rose-500 to-orange-500',
+  'from-teal-500 to-emerald-600',
+  'from-amber-500 to-orange-600',
+  'from-sky-500 to-indigo-600',
+  'from-fuchsia-500 to-pink-600',
+]
+
 /**
  * Light dashboard/landing screen. Deck management (the full expand/collapse
  * table, delete, import) moved to the Decks tab (see `ui/DecksView`) — this
@@ -105,20 +119,21 @@ export default function HomeView({
           <h2 className="text-sm font-medium text-neutral-500 dark:text-neutral-400">
             Your decks
           </h2>
-          {/* Narrow/touch viewports get a swipeable horizontal carousel (one
-           * card mostly-visible at a time, snapping); from `sm` up there's
-           * enough width that a horizontal scroller feels awkward, so it
-           * switches to a static grid instead. */}
-          <div className="flex snap-x snap-mandatory gap-3 overflow-x-auto pb-2 sm:grid sm:grid-cols-2 sm:overflow-visible sm:pb-0">
+          {/* A single column (full-width, stacked vertically) on narrow
+           * viewports — a horizontal scroller reads awkwardly here — that
+           * opens up into a 2-column grid once there's actually enough width
+           * for it (`sm` up) rather than staying single-column forever. */}
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             {tree.children.map((node, index) => {
               const due = node.newCount + node.learnCount + node.reviewCount
               // The first deck in the list is rendered "featured" (bigger
-              // padding/text), giving the stack the same slightly-expanded
-              // top-card look as the reference screenshots. Simplest stable
-              // choice: whatever rslib returns first, rather than re-sorting
-              // by due count and shuffling card positions as counts change
-              // during a study session.
+              // padding/text, spans both grid columns), giving the stack the
+              // same slightly-expanded top-card look as the reference
+              // screenshots. Simplest stable choice: whatever rslib returns
+              // first, rather than re-sorting by due count and shuffling card
+              // positions as counts change during a study session.
               const featured = index === 0
+              const gradient = DECK_CARD_GRADIENTS[index % DECK_CARD_GRADIENTS.length]
 
               return (
                 <button
@@ -126,8 +141,8 @@ export default function HomeView({
                   type="button"
                   onClick={() => handleStudy(node)}
                   disabled={due === 0}
-                  className={`min-w-[80%] shrink-0 snap-center rounded-2xl bg-indigo-600 text-left text-white shadow-md transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-indigo-500 dark:hover:bg-indigo-400 sm:min-w-0 sm:shrink ${
-                    featured ? 'p-7' : 'p-5'
+                  className={`bg-gradient-to-br ${gradient} rounded-2xl text-left text-white shadow-md transition-[filter] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:brightness-100 ${
+                    featured ? 'p-7 sm:col-span-2' : 'p-5'
                   }`}
                 >
                   <p
@@ -136,13 +151,13 @@ export default function HomeView({
                     {node.name}
                   </p>
                   <p
-                    className={`mt-2 font-bold tabular-nums text-indigo-100 dark:text-indigo-950/80 ${
+                    className={`mt-2 font-bold tabular-nums text-white/90 ${
                       featured ? 'text-4xl' : 'text-2xl'
                     }`}
                   >
                     {due}
                   </p>
-                  <p className="mt-1 text-sm text-indigo-100 dark:text-indigo-950/80">
+                  <p className="mt-1 text-sm text-white/80">
                     {due > 0 ? 'Due — tap to study' : 'All done'}
                   </p>
                 </button>
