@@ -80,7 +80,9 @@ function DeckCard({
   onStudy: (node: DeckTreeNode) => void
   onDelete: (id: bigint, name: string) => void
 }) {
-  const [expanded, setExpanded] = useState(true)
+  // Subdecks start collapsed — with any real depth this is a lot of full-size
+  // gradient cards to scroll past just to see the top-level decks.
+  const [expanded, setExpanded] = useState(false)
   const hasChildren = node.children.length > 0
   const gradient = gradientForDeck(node.deckId)
 
