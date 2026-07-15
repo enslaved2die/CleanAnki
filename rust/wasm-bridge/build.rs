@@ -74,6 +74,8 @@ fn main() {
         "_wasm_answer_card",
         "_wasm_sync_login",
         "_wasm_sync_collection",
+        "_wasm_sync_full_download",
+        "_wasm_sync_full_upload",
         "_wasm_sync_poll",
     ];
     let list = exported_functions

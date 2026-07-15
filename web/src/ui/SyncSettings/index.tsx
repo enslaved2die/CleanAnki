@@ -1,6 +1,12 @@
 import { useState } from 'react'
 import { motion } from 'framer-motion'
-import { syncLogin, syncCollection, FullSyncRequiredError } from '../../wasm/backend'
+import {
+  syncLogin,
+  syncCollection,
+  syncFullDownload,
+  syncFullUpload,
+  FullSyncRequiredError,
+} from '../../wasm/backend'
 import { persistCollection } from '../../db/collection'
 
 // Real sync, wired to rslib's actual sync protocol via the wasm bridge (see
@@ -52,6 +58,14 @@ export default function SyncSettings({
 
   const [syncStatus, setSyncStatus] = useState<'idle' | 'busy' | 'done' | 'error'>('idle')
   const [syncError, setSyncError] = useState<string | null>(null)
+  // Set when a normal sync reports the server needs a full up/download
+  // instead (rslib's `SyncActionRequired::FullSyncRequired` — typically the
+  // very first sync between this collection and that server, since there's
+  // no shared history yet for an incremental sync to reconcile). Cleared on
+  // the next successful normal sync.
+  const [needsFullSync, setNeedsFullSync] = useState(false)
+  const [fullSyncStatus, setFullSyncStatus] = useState<'idle' | 'busy' | 'done' | 'error'>('idle')
+  const [fullSyncError, setFullSyncError] = useState<string | null>(null)
 
   // Empty endpoint means official AnkiWeb (see `parse_endpoint` in
   // rust/wasm-bridge/src/main.rs) — only persist/use a real URL when the
@@ -91,6 +105,7 @@ export default function SyncSettings({
     if (!hkey) return
     setSyncStatus('busy')
     setSyncError(null)
+    setNeedsFullSync(false)
     onBusyChange?.(true)
     try {
       await syncCollection(hkey, effectiveEndpoint)
@@ -98,15 +113,65 @@ export default function SyncSettings({
       setSyncStatus('done')
     } catch (err) {
       if (err instanceof FullSyncRequiredError) {
-        setSyncError(
-          'This collection needs a full upload/download (e.g. it has never been synced before). ' +
-            'Full sync is not yet supported here — do the first full sync from Anki desktop, then ' +
-            'come back here for ordinary syncs.',
-        )
+        setNeedsFullSync(true)
+        setSyncStatus('idle')
       } else {
         setSyncError(errorMessage(err))
+        setSyncStatus('error')
       }
-      setSyncStatus('error')
+    } finally {
+      onBusyChange?.(false)
+    }
+  }
+
+  const handleFullDownload = async () => {
+    if (!hkey) return
+    // Destructive to local data — mirrors HomeView/StatisticsView's
+    // confirm-before-destroying pattern.
+    const ok = window.confirm(
+      'Download from server? This replaces your ENTIRE local collection with ' +
+        "the server's copy. Any local changes not already on the server will be lost. " +
+        'This cannot be undone.',
+    )
+    if (!ok) return
+
+    setFullSyncStatus('busy')
+    setFullSyncError(null)
+    onBusyChange?.(true)
+    try {
+      await syncFullDownload(hkey, effectiveEndpoint)
+      await persistCollection()
+      setNeedsFullSync(false)
+      setFullSyncStatus('done')
+    } catch (err) {
+      setFullSyncError(errorMessage(err))
+      setFullSyncStatus('error')
+    } finally {
+      onBusyChange?.(false)
+    }
+  }
+
+  const handleFullUpload = async () => {
+    if (!hkey) return
+    // Destructive to remote data.
+    const ok = window.confirm(
+      'Upload to server? This replaces the ENTIRE collection on the server with ' +
+        'your local copy. Anything on the server not already here will be lost — ' +
+        'including on any other device already synced to it. This cannot be undone.',
+    )
+    if (!ok) return
+
+    setFullSyncStatus('busy')
+    setFullSyncError(null)
+    onBusyChange?.(true)
+    try {
+      await syncFullUpload(hkey, effectiveEndpoint)
+      await persistCollection()
+      setNeedsFullSync(false)
+      setFullSyncStatus('done')
+    } catch (err) {
+      setFullSyncError(errorMessage(err))
+      setFullSyncStatus('error')
     } finally {
       onBusyChange?.(false)
     }
@@ -234,6 +299,52 @@ export default function SyncSettings({
           >
             {syncStatus === 'busy' ? 'Syncing…' : 'Sync now'}
           </button>
+
+          {needsFullSync && (
+            <div className="space-y-3 rounded-lg border border-amber-300 bg-amber-50 p-4 dark:border-amber-800 dark:bg-amber-950/50">
+              <p className="text-sm text-amber-800 dark:text-amber-200">
+                This server has no shared history with this collection yet — typically because
+                this is the first time these two have synced with each other (e.g. you already
+                synced this deck from Anki desktop, but this browser copy has never talked to the
+                server before). Pick a direction:
+              </p>
+
+              {fullSyncStatus === 'done' && (
+                <div className="rounded-lg bg-green-50 p-3 text-sm text-green-700 dark:bg-green-950/50 dark:text-green-300">
+                  Done. Use "Sync now" above for ordinary syncs from here on.
+                </div>
+              )}
+              {fullSyncStatus === 'error' && fullSyncError && (
+                <div className="rounded-lg bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950/50 dark:text-red-300">
+                  {fullSyncError}
+                </div>
+              )}
+
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={handleFullDownload}
+                  disabled={fullSyncStatus === 'busy'}
+                  className="flex-1 rounded-lg bg-amber-700 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-amber-800 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {fullSyncStatus === 'busy' ? 'Working…' : 'Download from server'}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleFullUpload}
+                  disabled={fullSyncStatus === 'busy'}
+                  className="flex-1 rounded-lg border border-amber-700 px-4 py-2.5 text-sm font-medium text-amber-800 transition-colors hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-50 dark:text-amber-200 dark:hover:bg-amber-900"
+                >
+                  {fullSyncStatus === 'busy' ? 'Working…' : 'Upload to server'}
+                </button>
+              </div>
+              <p className="text-xs text-amber-700 dark:text-amber-300">
+                "Download" replaces what's in this browser with the server's copy. "Upload"
+                replaces what's on the server with this browser's copy. Either is destructive to
+                the side it overwrites — pick whichever one is actually up to date.
+              </p>
+            </div>
+          )}
 
           <button
             type="button"

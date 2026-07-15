@@ -172,6 +172,8 @@ interface EmscriptenModule {
     endpointLen: number,
   ): number
   _wasm_sync_collection(hkeyPtr: number, hkeyLen: number, endpointPtr: number, endpointLen: number): number
+  _wasm_sync_full_download(hkeyPtr: number, hkeyLen: number, endpointPtr: number, endpointLen: number): number
+  _wasm_sync_full_upload(hkeyPtr: number, hkeyLen: number, endpointPtr: number, endpointLen: number): number
   _wasm_sync_poll(): number
 }
 
@@ -674,12 +676,11 @@ export async function syncLogin(
  * protocol logic) against `endpoint` (empty → official AnkiWeb) using a
  * previously obtained `hkey` (see `syncLogin`). Resolves once the sync
  * completes with no remote changes or a successful incremental sync; throws
- * `FullSyncRequiredError` if the server demands a full upload/download
- * (unsupported here — use Anki desktop for the collection's first full sync),
- * or a plain `Error` for any other failure (auth expired, network error,
- * sanity-check mismatch, etc). A sync can change local cards/notes/decks just
- * like an import or an answer does, so callers must still call
- * `persistCollection()` afterwards.
+ * `FullSyncRequiredError` if the server demands a full upload/download — see
+ * `syncFullDownload`/`syncFullUpload` for that case — or a plain `Error` for
+ * any other failure (auth expired, network error, sanity-check mismatch,
+ * etc). A sync can change local cards/notes/decks just like an import or an
+ * answer does, so callers must still call `persistCollection()` afterwards.
  */
 export async function syncCollection(hkey: string, endpoint: string): Promise<void> {
   const mod = await loadModule()
@@ -694,6 +695,57 @@ export async function syncCollection(hkey: string, endpoint: string): Promise<vo
   )
   if (rc !== 0) {
     throw new Error(`wasm_sync_collection failed to start (${rc}): ${readLastError(mod)}`)
+  }
+  await pollSyncUntilDone(mod)
+}
+
+/**
+ * Full download: replaces the local collection wholesale with the server's
+ * copy — the real Anki desktop "first sync" dialog's "Download from server"
+ * choice, for when the server is already authoritative (e.g. already synced
+ * from desktop Anki). **Destructive to local data** — any local-only changes
+ * are lost. Callers must still call `persistCollection()` afterwards (the
+ * bridge only replaces its own in-memory-FS copy of the file; nothing is
+ * written to OPFS until then), and should probably re-fetch anything they
+ * were showing (decks, current card, stats) since the collection underneath
+ * has been swapped out entirely.
+ */
+export async function syncFullDownload(hkey: string, endpoint: string): Promise<void> {
+  const mod = await loadModule()
+  const encoder = new TextEncoder()
+  const hkeyBytes = encoder.encode(hkey)
+  const endpointBytes = encoder.encode(endpoint)
+
+  const rc = withWasmBuffer(mod, hkeyBytes, (hkeyPtr, hkeyLen) =>
+    withWasmBuffer(mod, endpointBytes, (endpointPtr, endpointLen) =>
+      mod._wasm_sync_full_download(hkeyPtr, hkeyLen, endpointPtr, endpointLen),
+    ),
+  )
+  if (rc !== 0) {
+    throw new Error(`wasm_sync_full_download failed to start (${rc}): ${readLastError(mod)}`)
+  }
+  await pollSyncUntilDone(mod)
+}
+
+/**
+ * Full upload: replaces the *server's* collection wholesale with the local
+ * copy — the real Anki desktop "first sync" dialog's "Upload to server"
+ * choice, for when the local collection is authoritative. **Destructive to
+ * remote data.** Same shape as `syncFullDownload` otherwise.
+ */
+export async function syncFullUpload(hkey: string, endpoint: string): Promise<void> {
+  const mod = await loadModule()
+  const encoder = new TextEncoder()
+  const hkeyBytes = encoder.encode(hkey)
+  const endpointBytes = encoder.encode(endpoint)
+
+  const rc = withWasmBuffer(mod, hkeyBytes, (hkeyPtr, hkeyLen) =>
+    withWasmBuffer(mod, endpointBytes, (endpointPtr, endpointLen) =>
+      mod._wasm_sync_full_upload(hkeyPtr, hkeyLen, endpointPtr, endpointLen),
+    ),
+  )
+  if (rc !== 0) {
+    throw new Error(`wasm_sync_full_upload failed to start (${rc}): ${readLastError(mod)}`)
   }
   await pollSyncUntilDone(mod)
 }

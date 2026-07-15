@@ -2002,3 +2002,59 @@ CORS template from somewhere else.
 
 **Still unverified**: whether the corrected config actually resolves it end
 to end — the user has the fix but hasn't retried yet as of this writing.
+
+## 24. 2026-07-15 — CORS fixed for real; full upload/download implemented
+
+The user confirmed the corrected nginx config works: login against their
+real self-hosted server succeeds through the proxy. The very next step —
+`syncCollection`'s `NormalSyncer::sync()` — reported `FullSyncRequired`,
+which this app had deliberately left unimplemented (§20). The user's
+situation is exactly the case that requires it: they'd already used real
+Anki desktop to push the Spanish deck to this server, so the server has
+data, but this browser collection has never itself talked to that server —
+there's no shared sync history for an incremental sync to reconcile, so a
+one-time full replace (one side wins wholesale) is the only option, same as
+real Anki desktop's own first-sync dialog.
+
+**Implementation.** `Collection::full_download`/`full_upload`
+(`rust/vendor/anki/rslib/src/sync/collection/download.rs` and `upload.rs`,
+unmodified rslib logic) both fall through the exact same transport already
+built for `NormalSyncer` (`HttpSyncClient::download_with_progress`/
+`upload_with_progress` → the same `request_ext` → the same
+`zstd_request_with_timeout` patched in §20) — no new transport work needed.
+The one real wrinkle: both take `self` **by value** (they close the sqlite
+connection before doing any network I/O, win or lose), unlike
+`NormalSyncer::new(&mut col, ...)`. Added `take_collection`/
+`reopen_collection` helpers in `rust/wasm-bridge/src/main.rs`: take the
+`Collection` out of the bridge's `Mutex<Option<Collection>>` slot, run the
+full sync, then unconditionally rebuild a fresh `Collection` from
+`COLLECTION_PATH` afterward — safe either way, since a failed
+`full_download` never touches the on-disk file (only a *successful* one
+atomically renames the new data into place) and `full_upload` never
+modifies the local file at all in either outcome (it only reads and sends
+it). Factored the "build + enable FSRS" logic `wasm_open_collection` already
+did into a shared `build_collection_at_path()` so the reopened collection
+gets the same FSRS-default treatment as a normal fresh open, instead of
+silently losing it.
+
+New exports: `wasm_sync_full_download`/`wasm_sync_full_upload`, same
+start-then-poll shape as the existing sync exports (reusing `SYNC_STATE`/
+`wasm_sync_poll` — only one sync operation can usefully be in flight at
+once anyway). `web/src/wasm/backend.ts` gained matching `syncFullDownload`/
+`syncFullUpload` wrappers.
+
+**UI**: `SyncSettings` now turns a caught `FullSyncRequiredError` into two
+explicit, separately-confirmed destructive actions — "Download from server"
+(replace local with remote) and "Upload to server" (replace remote with
+local) — instead of a dead-end error message. Matches real Anki desktop's
+own first-sync dialog in spirit: this is a real decision only the user can
+make (which side is actually authoritative), never auto-resolved.
+
+**Verified**: fresh build clean, full test suite (33/33), `tsc --noEmit`
+clean, Sync tab renders correctly in the browser. **Not verified**: an
+actual full download/upload against a real server — this sandbox has no
+route to the user's server, and safely exercising the destructive upload
+path in particular isn't something to improvise against a stranger's real
+data. The user is in the exact situation this feature targets (server has
+data, browser collection doesn't share history with it yet), so they're
+well placed to try "Download from server" directly next.

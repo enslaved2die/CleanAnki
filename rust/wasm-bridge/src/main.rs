@@ -228,26 +228,16 @@ pub extern "C" fn wasm_init_backend() -> i32 {
 /// virtual FS and open that path. rusqlite's *bundled* SQLite (compiled from C
 /// by emcc) then does the actual open.
 ///
-/// # Safety
-/// `ptr`/`len` must describe a valid, readable byte slice (e.g. from
-/// `wasm_alloc` followed by a JS-side write of exactly `len` bytes).
-#[no_mangle]
-pub unsafe extern "C" fn wasm_open_collection(ptr: *const u8, len: usize) -> i32 {
-    let db_bytes = std::slice::from_raw_parts(ptr, len);
+/// Builds a `Collection` from whatever bytes currently live at
+/// `COLLECTION_PATH` on the (emscripten) virtual FS, applying the same setup
+/// every open needs (media paths, FSRS default). Shared by `wasm_open_collection`
+/// (which writes fresh bytes first) and the full-sync exports below (which
+/// reopen after `Collection::full_download`/`full_upload` — both take `self`
+/// by value and leave no usable `Collection` behind, even on failure, since
+/// they close the sqlite connection before doing the network I/O).
+fn build_collection_at_path() -> Result<Collection, String> {
     let tr = I18n::new(&["en"]);
-
-    if let Some(parent) = std::path::Path::new(COLLECTION_PATH).parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            set_last_error(e);
-            return -1;
-        }
-    }
-    if let Err(e) = std::fs::write(COLLECTION_PATH, db_bytes) {
-        set_last_error(e);
-        return -2;
-    }
-
-    let mut col = match CollectionBuilder::new(COLLECTION_PATH)
+    let mut col = CollectionBuilder::new(COLLECTION_PATH)
         .set_tr(tr)
         .set_server(false)
         // Derives `/anki/collection.media` (dir, created for us) and
@@ -259,13 +249,7 @@ pub unsafe extern "C" fn wasm_open_collection(ptr: *const u8, len: usize) -> i32
         // "attempted media operation without media folder set".
         .with_desktop_media_paths()
         .build()
-    {
-        Ok(col) => col,
-        Err(e) => {
-            set_last_error(e);
-            return -3;
-        }
-    };
+        .map_err(|e| e.to_string())?;
 
     // Make FSRS the active scheduling algorithm (real Anki's own recommended
     // default for new collections since 23.10). This is a single collection-
@@ -280,10 +264,37 @@ pub unsafe extern "C" fn wasm_open_collection(ptr: *const u8, len: usize) -> i32
     // only for brand-new collections, since this app has no UI to toggle it
     // off and imports discard scheduling state anyway (`with_scheduling:
     // false`, see `wasm_import_apkg`).
-    if let Err(e) = col.set_config_bool(BoolKey::Fsrs, true, false) {
-        set_last_error(e);
-        return -5;
+    col.set_config_bool(BoolKey::Fsrs, true, false)
+        .map_err(|e| e.to_string())?;
+
+    Ok(col)
+}
+
+/// # Safety
+/// `ptr`/`len` must describe a valid, readable byte slice (e.g. from
+/// `wasm_alloc` followed by a JS-side write of exactly `len` bytes).
+#[no_mangle]
+pub unsafe extern "C" fn wasm_open_collection(ptr: *const u8, len: usize) -> i32 {
+    let db_bytes = std::slice::from_raw_parts(ptr, len);
+
+    if let Some(parent) = std::path::Path::new(COLLECTION_PATH).parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            set_last_error(e);
+            return -1;
+        }
     }
+    if let Err(e) = std::fs::write(COLLECTION_PATH, db_bytes) {
+        set_last_error(e);
+        return -2;
+    }
+
+    let col = match build_collection_at_path() {
+        Ok(col) => col,
+        Err(e) => {
+            set_last_error(e);
+            return -3;
+        }
+    };
 
     match collection_slot().lock() {
         Ok(mut guard) => {
@@ -1362,6 +1373,188 @@ pub unsafe extern "C" fn wasm_sync_collection(
                 // See the matching comment in `wasm_sync_login`: `Debug`
                 // surfaces the nested error detail that `Display` collapses
                 // to just the bare variant name.
+                set_last_error(format!("{e:?}"));
+                SYNC_STATE.store(SYNC_ERR_GENERIC, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    });
+    0
+}
+
+/// Takes the open `Collection` out of `COLLECTION`, for the full-sync exports
+/// below: `Collection::full_download`/`full_upload` both take `self` **by
+/// value** (they close the sqlite connection internally before doing any
+/// network I/O, succeed or fail), so there is no `&mut Collection` to hand
+/// them the way `wasm_sync_collection`'s `NormalSyncer` gets one. Whatever
+/// calls this must call `reopen_collection` afterwards, unconditionally,
+/// win or lose — see that function's doc comment for why that's always safe.
+fn take_collection() -> Result<Collection, String> {
+    let mut guard = collection_slot()
+        .lock()
+        .map_err(|_| "internal lock poisoned".to_string())?;
+    guard
+        .take()
+        .ok_or_else(|| "no collection open; call wasm_open_collection first".to_string())
+}
+
+/// Rebuilds a `Collection` from `COLLECTION_PATH` and stores it back in
+/// `COLLECTION`. Safe to call after either outcome of `full_download`/
+/// `full_upload`: a successful `full_download` already atomically renamed the
+/// downloaded file over `COLLECTION_PATH` before returning, so this picks up
+/// the new data; a failed download never touches `COLLECTION_PATH` at all,
+/// and `full_upload` never modifies the local file in either case (it only
+/// reads and sends it) — so reopening always yields a valid, usable
+/// collection, whichever way the sync went.
+fn reopen_collection() -> Result<(), String> {
+    let col = build_collection_at_path()?;
+    let mut guard = collection_slot()
+        .lock()
+        .map_err(|_| "internal lock poisoned".to_string())?;
+    *guard = Some(col);
+    Ok(())
+}
+
+/// Begin a **full download**: replaces the local collection wholesale with
+/// the server's copy. This is the real Anki desktop "first sync" dialog's
+/// "Download from server" choice — for when the server already has the
+/// authoritative data (e.g. pushed there from desktop Anki already) and the
+/// local collection should be discarded. **Destructive to local data** —
+/// any local-only changes not already on the server are lost. Returns 0 once
+/// started; JS polls `wasm_sync_poll` same as the other sync exports (2 =
+/// success, persist afterwards; negative = message in `wasm_last_error_*`).
+///
+/// # Safety
+/// Each `(ptr, len)` pair must describe a valid, readable byte slice (or
+/// `len == 0`).
+#[no_mangle]
+pub unsafe extern "C" fn wasm_sync_full_download(
+    hkey_ptr: *const u8,
+    hkey_len: usize,
+    endpoint_ptr: *const u8,
+    endpoint_len: usize,
+) -> i32 {
+    let hkey = match str_from_raw(hkey_ptr, hkey_len) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+    let endpoint = match str_from_raw(endpoint_ptr, endpoint_len) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+    let endpoint_opt = match parse_endpoint(&endpoint) {
+        Ok(e) => e,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+
+    SYNC_STATE.store(SYNC_STATE_RUNNING, std::sync::atomic::Ordering::SeqCst);
+    std::thread::spawn(move || {
+        let col = match take_collection() {
+            Ok(c) => c,
+            Err(e) => {
+                set_last_error(e);
+                SYNC_STATE.store(SYNC_ERR_GENERIC, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+        };
+        let auth = SyncAuth {
+            hkey,
+            endpoint: endpoint_opt,
+            io_timeout_secs: None,
+        };
+        let result = block_on(col.full_download(auth, build_sync_http_client()));
+        if let Err(e) = reopen_collection() {
+            set_last_error(format!(
+                "full download {}, but failed to reopen the collection afterwards: {e}",
+                if result.is_ok() { "succeeded" } else { "also failed" }
+            ));
+            SYNC_STATE.store(SYNC_ERR_GENERIC, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+        match result {
+            Ok(()) => SYNC_STATE.store(SYNC_STATE_DONE_OK, std::sync::atomic::Ordering::SeqCst),
+            Err(e) => {
+                set_last_error(format!("{e:?}"));
+                SYNC_STATE.store(SYNC_ERR_GENERIC, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    });
+    0
+}
+
+/// Begin a **full upload**: replaces the server's collection wholesale with
+/// the local copy. The real Anki desktop "first sync" dialog's "Upload to
+/// server" choice — for when the *local* collection is authoritative and the
+/// server's copy (if any) should be discarded. **Destructive to remote
+/// data.** Same start-then-poll shape as `wasm_sync_full_download`.
+///
+/// # Safety
+/// Each `(ptr, len)` pair must describe a valid, readable byte slice (or
+/// `len == 0`).
+#[no_mangle]
+pub unsafe extern "C" fn wasm_sync_full_upload(
+    hkey_ptr: *const u8,
+    hkey_len: usize,
+    endpoint_ptr: *const u8,
+    endpoint_len: usize,
+) -> i32 {
+    let hkey = match str_from_raw(hkey_ptr, hkey_len) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+    let endpoint = match str_from_raw(endpoint_ptr, endpoint_len) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+    let endpoint_opt = match parse_endpoint(&endpoint) {
+        Ok(e) => e,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+
+    SYNC_STATE.store(SYNC_STATE_RUNNING, std::sync::atomic::Ordering::SeqCst);
+    std::thread::spawn(move || {
+        let col = match take_collection() {
+            Ok(c) => c,
+            Err(e) => {
+                set_last_error(e);
+                SYNC_STATE.store(SYNC_ERR_GENERIC, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+        };
+        let auth = SyncAuth {
+            hkey,
+            endpoint: endpoint_opt,
+            io_timeout_secs: None,
+        };
+        let result = block_on(col.full_upload(auth, build_sync_http_client()));
+        if let Err(e) = reopen_collection() {
+            set_last_error(format!(
+                "full upload {}, but failed to reopen the collection afterwards: {e}",
+                if result.is_ok() { "succeeded" } else { "also failed" }
+            ));
+            SYNC_STATE.store(SYNC_ERR_GENERIC, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+        match result {
+            Ok(()) => SYNC_STATE.store(SYNC_STATE_DONE_OK, std::sync::atomic::Ordering::SeqCst),
+            Err(e) => {
                 set_last_error(format!("{e:?}"));
                 SYNC_STATE.store(SYNC_ERR_GENERIC, std::sync::atomic::Ordering::SeqCst);
             }
