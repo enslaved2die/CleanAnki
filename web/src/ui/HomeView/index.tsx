@@ -44,11 +44,11 @@ function withCurrentDeckFirst(
   return reordered
 }
 
-/** Cycled by deck position so cards read as distinct decks at a glance
- * instead of a wall of identical indigo — `bg-gradient-to-br` pairs picked to
- * stay in the same saturated, mid-dark range as the original indigo card so
- * white text/counts stay readable in both light and dark mode without needing
- * a separate dark-mode palette. */
+/** Cycled by deck *identity* (not list position!) so each deck reads as
+ * visually distinct at a glance — `bg-gradient-to-br` pairs picked to stay in
+ * the same saturated, mid-dark range as the original indigo card so white
+ * text/counts stay readable in both light and dark mode without needing a
+ * separate dark-mode palette. */
 const DECK_CARD_GRADIENTS = [
   'from-indigo-500 to-violet-600',
   'from-rose-500 to-orange-500',
@@ -57,6 +57,23 @@ const DECK_CARD_GRADIENTS = [
   'from-sky-500 to-indigo-600',
   'from-fuchsia-500 to-pink-600',
 ]
+
+/**
+ * Picks a deck's gradient from its own id, not its position in the rendered
+ * list — `withCurrentDeckFirst` reorders that list every time the "last
+ * studied" deck changes, and a position-keyed color would make a deck's card
+ * change color the moment it gets featured/unfeatured, which reads as broken
+ * ("wait, didn't that used to be green?"). Deck ids are stable for the deck's
+ * whole lifetime, so `deckId % palette length` gives every deck one color it
+ * keeps forever, regardless of where it's sorted.
+ */
+function gradientForDeck(deckId: bigint): string {
+  const index = Number(
+    ((deckId % BigInt(DECK_CARD_GRADIENTS.length)) + BigInt(DECK_CARD_GRADIENTS.length)) %
+      BigInt(DECK_CARD_GRADIENTS.length),
+  )
+  return DECK_CARD_GRADIENTS[index]
+}
 
 /**
  * Light dashboard/landing screen. Deck management (the full expand/collapse
@@ -167,7 +184,7 @@ export default function HomeView({
               // `getCurrentDeckId`) is featured: sorted first, bigger
               // padding/text, spans both grid columns.
               const featured = index === 0
-              const gradient = DECK_CARD_GRADIENTS[index % DECK_CARD_GRADIENTS.length]
+              const gradient = gradientForDeck(node.deckId)
 
               return (
                 <button
