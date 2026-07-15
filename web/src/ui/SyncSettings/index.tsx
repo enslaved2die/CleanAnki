@@ -5,9 +5,10 @@ import {
   syncCollection,
   syncFullDownload,
   syncFullUpload,
+  syncMedia,
   FullSyncRequiredError,
 } from '../../wasm/backend'
-import { persistCollection } from '../../db/collection'
+import { persistCollection, persistMedia } from '../../db/collection'
 
 // Real sync, wired to rslib's actual sync protocol via the wasm bridge (see
 // rust/wasm-bridge/src/main.rs `wasm_sync_login`/`wasm_sync_collection` and
@@ -67,6 +68,14 @@ export default function SyncSettings({
   const [fullSyncStatus, setFullSyncStatus] = useState<'idle' | 'busy' | 'done' | 'error'>('idle')
   const [fullSyncError, setFullSyncError] = useState<string | null>(null)
 
+  // Media (images/audio) sync is a separate protocol from collection sync —
+  // see `syncMedia`'s doc comment in wasm/backend.ts. Tracked separately so a
+  // media-sync failure (shown as a warning) doesn't look like the collection
+  // sync itself failed — the notes/cards/decks are still correctly synced
+  // either way.
+  const [mediaSyncStatus, setMediaSyncStatus] = useState<'idle' | 'busy' | 'done' | 'error'>('idle')
+  const [mediaSyncError, setMediaSyncError] = useState<string | null>(null)
+
   // Empty endpoint means official AnkiWeb (see `parse_endpoint` in
   // rust/wasm-bridge/src/main.rs) — only persist/use a real URL when the
   // "use custom server" checkbox is on.
@@ -101,6 +110,25 @@ export default function SyncSettings({
     setSyncError(null)
   }
 
+  // Runs after any successful collection sync (normal, full-download, or
+  // full-upload) — real Anki desktop always does both under its one "Sync"
+  // button, and without this notes/cards sync fine but the images/audio they
+  // reference never actually get fetched. Deliberately does NOT throw: a
+  // media-sync failure is surfaced as its own warning rather than making the
+  // (already-successful) collection sync look like it failed too.
+  const syncMediaAfterCollectionSync = async (currentHkey: string) => {
+    setMediaSyncStatus('busy')
+    setMediaSyncError(null)
+    try {
+      await syncMedia(currentHkey, effectiveEndpoint)
+      await persistMedia()
+      setMediaSyncStatus('done')
+    } catch (err) {
+      setMediaSyncError(errorMessage(err))
+      setMediaSyncStatus('error')
+    }
+  }
+
   const handleSyncNow = async () => {
     if (!hkey) return
     setSyncStatus('busy')
@@ -111,6 +139,7 @@ export default function SyncSettings({
       await syncCollection(hkey, effectiveEndpoint)
       await persistCollection()
       setSyncStatus('done')
+      await syncMediaAfterCollectionSync(hkey)
     } catch (err) {
       if (err instanceof FullSyncRequiredError) {
         setNeedsFullSync(true)
@@ -143,6 +172,7 @@ export default function SyncSettings({
       await persistCollection()
       setNeedsFullSync(false)
       setFullSyncStatus('done')
+      await syncMediaAfterCollectionSync(hkey)
     } catch (err) {
       setFullSyncError(errorMessage(err))
       setFullSyncStatus('error')
@@ -169,6 +199,7 @@ export default function SyncSettings({
       await persistCollection()
       setNeedsFullSync(false)
       setFullSyncStatus('done')
+      await syncMediaAfterCollectionSync(hkey)
     } catch (err) {
       setFullSyncError(errorMessage(err))
       setFullSyncStatus('error')
@@ -279,9 +310,11 @@ export default function SyncSettings({
             Logged in{useCustomServer && endpoint ? ` to ${endpoint}` : ' to AnkiWeb'}.
           </div>
 
-          {syncStatus === 'done' && (
+          {syncStatus === 'done' && mediaSyncStatus !== 'error' && (
             <div className="rounded-lg bg-green-50 p-4 text-sm text-green-700 dark:bg-green-950/50 dark:text-green-300">
-              Sync complete.
+              {mediaSyncStatus === 'busy'
+                ? 'Collection synced — syncing media (images/audio)…'
+                : 'Sync complete (collection + media).'}
             </div>
           )}
 
@@ -291,13 +324,23 @@ export default function SyncSettings({
             </div>
           )}
 
+          {mediaSyncStatus === 'error' && mediaSyncError && (
+            <div className="rounded-lg bg-amber-50 p-4 text-sm text-amber-800 dark:bg-amber-950/50 dark:text-amber-200">
+              Collection synced, but media (images/audio) sync failed: {mediaSyncError}
+            </div>
+          )}
+
           <button
             type="button"
             onClick={handleSyncNow}
-            disabled={syncStatus === 'busy'}
+            disabled={syncStatus === 'busy' || mediaSyncStatus === 'busy'}
             className="w-full rounded-lg bg-neutral-900 px-4 py-2.5 font-medium text-white transition-colors hover:bg-neutral-800 disabled:opacity-50 disabled:cursor-not-allowed dark:bg-neutral-100 dark:text-neutral-900 dark:hover:bg-neutral-200 dark:disabled:opacity-50"
           >
-            {syncStatus === 'busy' ? 'Syncing…' : 'Sync now'}
+            {syncStatus === 'busy'
+              ? 'Syncing…'
+              : mediaSyncStatus === 'busy'
+                ? 'Syncing media…'
+                : 'Sync now'}
           </button>
 
           {needsFullSync && (

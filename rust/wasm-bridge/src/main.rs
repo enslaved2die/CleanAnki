@@ -51,6 +51,7 @@ use anki::sync::collection::normal::SyncActionRequired;
 use anki::sync::http_client::HttpSyncClient;
 use anki::sync::login::sync_login;
 use anki::sync::login::SyncAuth;
+use anki::sync::media::progress::MediaSyncProgress;
 use anki::template::RenderedNode;
 use anki::timestamp::TimestampMillis;
 use anki::timestamp::TimestampSecs;
@@ -1552,6 +1553,109 @@ pub unsafe extern "C" fn wasm_sync_full_upload(
             SYNC_STATE.store(SYNC_ERR_GENERIC, std::sync::atomic::Ordering::SeqCst);
             return;
         }
+        match result {
+            Ok(()) => SYNC_STATE.store(SYNC_STATE_DONE_OK, std::sync::atomic::Ordering::SeqCst),
+            Err(e) => {
+                set_last_error(format!("{e:?}"));
+                SYNC_STATE.store(SYNC_ERR_GENERIC, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    });
+    0
+}
+
+/// Begin a **media sync** — a separate protocol and a separate server-side
+/// database from collection sync (`wasm_sync_collection`/`_full_download`/
+/// `_full_upload` only ever transfer the `.anki2` SQLite file; this is what
+/// actually fetches/sends the image and audio files referenced from note
+/// fields). Real Anki desktop always runs both when you hit its one "Sync"
+/// button; this bridge exposes them as two exports so the caller can chain
+/// them the same way (and so a media-sync failure doesn't have to undo an
+/// already-successful collection sync). Same start-then-poll shape as the
+/// other sync exports (reuses `SYNC_STATE`/`wasm_sync_poll`).
+///
+/// `Collection::media()` derives the media folder/tracking-database paths
+/// from `COLLECTION_PATH` (`with_desktop_media_paths`, set at open time), so
+/// no new path plumbing is needed. Downloaded files are written directly
+/// into `MEDIA_FOLDER` by rslib's own sync code — the caller should run the
+/// existing `wasm_list_media_files`/`wasm_read_media_file` → OPFS shuttle
+/// (`persistMedia()` on the JS side, already used after `wasm_import_apkg`)
+/// afterwards to persist them, exactly as it already does after an import.
+///
+/// Only `mgr`/`progress` are extracted from the open collection; the
+/// collection lock is released *before* the (potentially slow, many-files)
+/// network transfer runs — unlike `wasm_sync_collection`, media sync never
+/// needs continued access to the `Collection` itself, so there's no reason
+/// to block other bridge calls for its whole duration.
+///
+/// # Safety
+/// Each `(ptr, len)` pair must describe a valid, readable byte slice (or
+/// `len == 0`).
+#[no_mangle]
+pub unsafe extern "C" fn wasm_sync_media(
+    hkey_ptr: *const u8,
+    hkey_len: usize,
+    endpoint_ptr: *const u8,
+    endpoint_len: usize,
+) -> i32 {
+    let hkey = match str_from_raw(hkey_ptr, hkey_len) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+    let endpoint = match str_from_raw(endpoint_ptr, endpoint_len) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+    let endpoint_opt = match parse_endpoint(&endpoint) {
+        Ok(e) => e,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+
+    SYNC_STATE.store(SYNC_STATE_RUNNING, std::sync::atomic::Ordering::SeqCst);
+    std::thread::spawn(move || {
+        let (mgr, progress) = {
+            let mut guard = match collection_slot().lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    set_last_error("internal lock poisoned");
+                    SYNC_STATE.store(SYNC_ERR_GENERIC, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+            };
+            let col = match guard.as_mut() {
+                Some(c) => c,
+                None => {
+                    set_last_error("no collection open; call wasm_open_collection first");
+                    SYNC_STATE.store(SYNC_ERR_GENERIC, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+            };
+            let mgr = match col.media() {
+                Ok(m) => m,
+                Err(e) => {
+                    set_last_error(e);
+                    SYNC_STATE.store(SYNC_ERR_GENERIC, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+            };
+            (mgr, col.new_progress_handler::<MediaSyncProgress>())
+        };
+
+        let auth = SyncAuth {
+            hkey,
+            endpoint: endpoint_opt,
+            io_timeout_secs: None,
+        };
+        let result = block_on(mgr.sync_media(progress, auth, build_sync_http_client(), None));
         match result {
             Ok(()) => SYNC_STATE.store(SYNC_STATE_DONE_OK, std::sync::atomic::Ordering::SeqCst),
             Err(e) => {

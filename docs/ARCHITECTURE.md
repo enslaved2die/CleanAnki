@@ -2058,3 +2058,63 @@ path in particular isn't something to improvise against a stranger's real
 data. The user is in the exact situation this feature targets (server has
 data, browser collection doesn't share history with it yet), so they're
 well placed to try "Download from server" directly next.
+
+## 25. 2026-07-15 — Media sync: a completely separate protocol we hadn't built yet
+
+The user downloaded successfully (§24) but reported images missing from the
+deck. Root cause: **collection sync and media sync are two entirely separate
+protocols in real Anki**, with separate server-side databases — everything
+built through §24 (`NormalSyncer`, `full_download`, `full_upload`) only ever
+transfers the `.anki2` SQLite file (notes/cards/decks/scheduling/revlog).
+The actual image/audio *files* referenced from note fields are a different
+sync mechanism entirely (`rslib/src/sync/media/`, ~2500 lines: its own
+client-side change-tracking database, a zip-batched upload/download
+protocol, checksum reconciliation, sanity checks). Real Anki desktop runs
+both under one "Sync" button; this app had only ever built the first half.
+
+**Confirmed the hard part was already solved.** `MediaSyncProtocol`'s
+endpoints (`msync/begin`, `msync/mediaChanges`, etc.) go through the exact
+same `HttpSyncClient`/`request_ext`/`zstd_request_with_timeout` transport
+already patched for wasm in §20 — just a different `AsSyncEndpoint` prefix.
+No new transport work needed; the CORS proxy from §21-23 already covers
+this too, since it's the same server, same origin.
+
+**Implementation**, `rust/wasm-bridge/src/main.rs`'s `wasm_sync_media`: the
+real API turned out to be small — `Collection::media() -> Result<MediaManager>`
+(already fully wired, since `with_desktop_media_paths` — called at every
+collection open — already derives both the media folder *and* a media
+tracking-database path, `collection.mdb`, from `COLLECTION_PATH`) and
+`MediaManager::sync_media(self, progress, auth, client, server_usn)`. Unlike
+`wasm_sync_collection`, this only needs the collection lock long enough to
+extract `mgr`/`progress` — the actual (potentially slow, many-files)
+transfer runs with the lock already released, so a media sync doesn't block
+other bridge calls the way a collection sync does. Downloaded files land
+directly in `MEDIA_FOLDER` via rslib's own code; the existing `persistMedia()`
+JS helper (already used after `importApkg`) picks them up and copies them to
+OPFS — no new persistence plumbing needed there either.
+
+**`SyncSettings` now chains it automatically** after every successful
+collection sync/full-download/full-upload, matching real Anki's one-button
+UX instead of requiring a separate manual step. A media-sync failure is
+surfaced as a distinct warning rather than making the (already-successful)
+collection sync look like it failed — they're genuinely independent
+outcomes in real Anki too.
+
+**Known, accepted limitation**: the media tracking database (`collection.mdb`)
+itself is not persisted to OPFS (only the media *files* are, via
+`persistMedia`). This means every browser session's first media sync starts
+from an empty tracking DB rather than picking up where the last session left
+off — `register_changes` treats every existing local file as "new" and
+re-registers it, so each session does a full reconciliation pass instead of
+an incremental one. This is believed to be safe (checksums should still
+avoid redundant transfer of files already present on the server) but is
+less efficient than real Anki desktop, which persists this database
+indefinitely. Flagged rather than silently left as a surprise; picking this
+up is a reasonable, separately-scoped follow-up if it turns out to matter in
+practice (e.g. for very large media folders).
+
+**Verified**: fresh build clean, full test suite (33/33), `tsc --noEmit`
+clean, Sync tab renders correctly. **Not verified**: an actual media sync
+against the user's real server — same sandbox reachability limitation as
+§20-24. The user should re-run "Sync now" (or re-do the full download) and
+check whether images now appear.

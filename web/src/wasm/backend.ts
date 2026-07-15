@@ -174,6 +174,7 @@ interface EmscriptenModule {
   _wasm_sync_collection(hkeyPtr: number, hkeyLen: number, endpointPtr: number, endpointLen: number): number
   _wasm_sync_full_download(hkeyPtr: number, hkeyLen: number, endpointPtr: number, endpointLen: number): number
   _wasm_sync_full_upload(hkeyPtr: number, hkeyLen: number, endpointPtr: number, endpointLen: number): number
+  _wasm_sync_media(hkeyPtr: number, hkeyLen: number, endpointPtr: number, endpointLen: number): number
   _wasm_sync_poll(): number
 }
 
@@ -746,6 +747,36 @@ export async function syncFullUpload(hkey: string, endpoint: string): Promise<vo
   )
   if (rc !== 0) {
     throw new Error(`wasm_sync_full_upload failed to start (${rc}): ${readLastError(mod)}`)
+  }
+  await pollSyncUntilDone(mod)
+}
+
+/**
+ * Syncs media (images/audio referenced by note fields) — a completely
+ * separate protocol and server-side database from collection sync
+ * (`syncCollection`/`syncFullDownload`/`syncFullUpload` only ever transfer
+ * the `.anki2` file itself). Real Anki desktop always runs both under its
+ * one "Sync" button; callers here should do the same — run this after a
+ * successful collection sync/full-download/full-upload, since without it
+ * notes can reference images/audio that were never actually fetched (the
+ * collection data downloads fine; the files it points at don't, until this
+ * runs too). Downloaded files land in the bridge's in-memory media folder —
+ * call `persistMedia()` (`db/collection.ts`) afterwards to copy them to OPFS,
+ * exactly as already done after `importApkg`.
+ */
+export async function syncMedia(hkey: string, endpoint: string): Promise<void> {
+  const mod = await loadModule()
+  const encoder = new TextEncoder()
+  const hkeyBytes = encoder.encode(hkey)
+  const endpointBytes = encoder.encode(endpoint)
+
+  const rc = withWasmBuffer(mod, hkeyBytes, (hkeyPtr, hkeyLen) =>
+    withWasmBuffer(mod, endpointBytes, (endpointPtr, endpointLen) =>
+      mod._wasm_sync_media(hkeyPtr, hkeyLen, endpointPtr, endpointLen),
+    ),
+  )
+  if (rc !== 0) {
+    throw new Error(`wasm_sync_media failed to start (${rc}): ${readLastError(mod)}`)
   }
   await pollSyncUntilDone(mod)
 }
