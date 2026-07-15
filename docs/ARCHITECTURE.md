@@ -2350,3 +2350,99 @@ user-run dev server, and disturbing it risked interfering with the user's
 own session. **Not verified**: the progress bar actually rendering during a
 real sync against a real server — the user is best placed to confirm what
 the live counters/percentage look like in practice.
+
+## 29. 2026-07-15 — Duolingo-style redesign: bottom nav, Study card stack, Profile+charts
+
+The user asked to push the visual design toward two Dribbble references
+(rounded, colorful, card-based, bottom nav with a filled active pill,
+touch-first flashcard controls, a "stack of cards" that shrinks toward a
+daily target) and explicitly asked for multi-agent delegation scaled to
+task complexity. Planned in plan-mode first (see the approved plan for the
+full rationale — design direction, real-data sourcing decisions, and the
+exact task split), then executed as four background agents plus this
+integration pass:
+
+- **Task A (Opus)** — `ui/StudyView`: a Duolingo/Tinder-style visible card
+  stack (2 decorative layers behind the live card via `AnimatePresence
+  mode="popLayout"`, keyed by an answered-count so each grade flings the
+  top card off and the next settles in), a real progress bar driven by a
+  new optional `initialQueueTotal?: number` prop, drag-proportional
+  colored GOOD/AGAIN feedback labels (separate `useMotionValue` from the
+  card's own drag transform, so its exit animation never fights a value
+  we're reading), and tap-to-flip alongside the existing "Show Answer"
+  button. Zero changes to `CardFrame`, `answerCard`, `getNextCard`, or any
+  scheduling semantics — purely a wrapper/interaction layer.
+- **Task C (Sonnet)** — `ui/charts/DonutChart.tsx` +
+  `ui/charts/ForecastBarChart.tsx`: hand-rolled SVG (no new dependency —
+  this project has never added a chart library, and the data here is
+  simple enough not to need one). Each extracts its actual math
+  (`computeDonutArcs`, `computeForecastBars`) into pure, exported functions
+  so it's unit-testable without a DOM-rendering test setup (this project
+  has no React Testing Library) — 13 new tests in `tests/ui/charts.test.ts`.
+- **Task B (Opus)** — one additive Rust field
+  (`wasm_get_stats` gained `dueForecast: [{day, count}]` for days 0..6,
+  reusing the `future_due` map the existing `dueToday`/`dueThisWeek`/
+  `backlog` sums already read — no new fetch, no other field touched), and
+  merged `SyncSettings` + `StatisticsView` into one `ui/ProfileView`:
+  logged-out is the exact existing login form (restyled); logged-in adds a
+  username (newly persisted to `localStorage` alongside the hkey) and
+  renders the stats section through Task C's charts instead of bare number
+  tiles. Every existing sync behavior — `onBusyChange`'s lock-contention
+  guard, the `FullSyncRequiredError` full-sync flow, media-sync chaining,
+  the live sync progress bar from §28 — was preserved exactly; the merge
+  also had to make the minimal `App.tsx` wiring change needed to keep the
+  project compiling (swap the two old imports for `ProfileView`, add
+  `onAuthChange`) without doing the actual nav redesign, so the very next
+  task had a clean, still-green base to build on.
+- **Task D (Sonnet)** — the actual nav redesign: bottom tab bar (Home /
+  Study / Decks / Profile) with hand-drawn inline SVG icons (no icon
+  library exists in this project either), reusing the existing
+  `layoutId="active-tab"` spring-pill pattern. Split the old combined
+  Home/deck-table view in two: a light `HomeView` dashboard (today's
+  aggregate due count + "Continue studying") and a new `DecksView` (the
+  old deck-management table, moved near-verbatim) with a "+" button
+  opening a small menu — "Import .apkg" (the existing `ImportView`,
+  completely untouched, just remounted inside a modal instead of its own
+  tab) and a visibly disabled "Create new deck / Soon" placeholder.
+
+**On the "daily target" progress bar — no new tracking invented.**
+`getDeckTree()` already returns each deck's `newCount`/`learnCount`/
+`reviewCount`, and those numbers already reflect real Anki's own per-deck
+daily-new-card limits (rslib computes them, not this app). Studying a
+specific deck from Decks passes that deck's own total as
+`initialQueueTotal`; the dashboard's "Continue studying" passes the
+synthetic root node's aggregate (rslib's own whole-collection total, no
+extra math needed) without touching the current-deck selection. Reaching
+Study without either context (e.g. a reload mid-session) just falls back
+to an indeterminate bar rather than guessing — no fabricated numbers
+anywhere in this feature.
+
+**Deliberately out of scope**, per explicit instruction: actual deck
+*creation* — the Decks "+" menu shows the entry but it's disabled. Also
+deliberately not built: the streak/daily-calendar strip from the Langura
+reference (it needs new persistent state — a study-streak log — that
+doesn't exist and wasn't asked for).
+
+**Verified**: `tsc --noEmit` and the full test suite (46/46 — 33 baseline +
+13 new chart tests) clean after every stage and again after integration;
+fresh wasm rebuild for the `dueForecast` field confirmed via
+`bash rust/wasm-bridge/build.sh` + `sync-wasm-artifacts.sh`. Real
+browser pass (mobile viewport, light + dark): Home → tapped "Continue
+studying" → landed on Study with a real "0 / 1" progress bar for the
+actual due deck → revealed → graded "Good" → bar advanced to "1 / 1" and
+the deck's Decks-tab counts updated to match (Learn: 1) in the very next
+screen, confirming this is real rslib scheduling data end to end, not a
+mocked number. Decks' "+" menu, the Import modal, and the Profile tab's
+"Log In"/"Profile" label swap all confirmed visually. **Not verified**: an
+actual login against a real server from this redesigned Profile page (same
+standing sandbox limitation as every other sync feature this session) —
+the sync logic itself is unchanged from the already-verified version.
+
+**Roadmap** (not started, noted here so it isn't lost): the user's
+end goal is full deck *creation and editing* in this web client — new
+notetypes/notes/decks built from scratch, not just imported — kept fully
+syncable with real Anki Desktop via the same sync protocol already
+implemented (§18-25). That's a materially bigger effort than this pass
+(it touches note/notetype editing UI that doesn't exist yet at all,
+plus care around how sync reconciles client-created content), deliberately
+deferred rather than half-built alongside a visual redesign.
