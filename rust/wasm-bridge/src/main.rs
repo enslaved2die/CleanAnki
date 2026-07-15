@@ -44,6 +44,8 @@ use anki::prelude::BoolKey;
 use anki::prelude::CardId;
 use anki::prelude::DeckId;
 use anki::prelude::I18n;
+use anki::prelude::Note;
+use anki::prelude::NoteId;
 use anki::scheduler::answering::CardAnswer;
 use anki::scheduler::answering::Rating;
 use anki::scheduler::queue::QueuedCard;
@@ -762,6 +764,405 @@ pub unsafe extern "C" fn wasm_create_deck(ptr: *const u8, len: usize) -> i32 {
         Err(e) => {
             set_last_error(e);
             -3
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Note CRUD (list / add / get / update)
+//
+// These mirror the real Anki desktop Add/Browse/Edit flow, backed by rslib's
+// genuine `Collection::add_note`/`update_note`/`search_notes_unordered` and
+// `SqliteStorage::get_note` — the same calls the desktop dialogs are built on.
+// The list/get/update path is deliberately notetype-agnostic (field *names* are
+// always queried live from the note's own notetype), so it works on notes from
+// any imported `.apkg`, not just the stock "Basic" notes this app can add.
+// ---------------------------------------------------------------------------
+
+/// Returns the stock "Basic" notetype's id and its real field names, so the
+/// (follow-up) Add-note UI can label its inputs with the notetype's actual
+/// field names (e.g. "Front"/"Back") rather than hardcoding them — the names
+/// are read live from `Notetype::fields`, not assumed. `notetypeId` is encoded
+/// as a JSON **string** (an i64 that can exceed `Number.MAX_SAFE_INTEGER` —
+/// same convention as deck ids in `wasm_create_deck`/`wasm_list_decks`).
+///
+/// A `None` result from `get_notetype_by_name` (the stock notetype somehow
+/// absent — shouldn't happen for a real collection) is surfaced as a real
+/// error rather than a panic.
+///
+/// Result JSON: `{"notetypeId":"<id>","fieldNames":["Front","Back"]}`.
+/// Returns 0 on success, negative on error (see `wasm_last_error_*`).
+#[no_mangle]
+pub extern "C" fn wasm_get_basic_notetype_info() -> i32 {
+    let mut guard = match collection_slot().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            set_last_error("internal lock poisoned");
+            return -2;
+        }
+    };
+    let col = match guard.as_mut() {
+        Some(c) => c,
+        None => {
+            set_last_error("no collection open; call wasm_open_collection first");
+            return -1;
+        }
+    };
+
+    let notetype = match col.get_notetype_by_name("Basic") {
+        Ok(Some(nt)) => nt,
+        Ok(None) => {
+            set_last_error("stock 'Basic' notetype not found in collection");
+            return -3;
+        }
+        Err(e) => {
+            set_last_error(e);
+            return -3;
+        }
+    };
+
+    let field_names: Vec<&str> = notetype.fields.iter().map(|f| f.name.as_str()).collect();
+    let payload = serde_json::json!({
+        "notetypeId": notetype.id.0.to_string(),
+        "fieldNames": field_names,
+    });
+
+    match serde_json::to_vec(&payload) {
+        Ok(bytes) => {
+            set_last_result(bytes);
+            0
+        }
+        Err(e) => {
+            set_last_error(e);
+            -4
+        }
+    }
+}
+
+/// Adds a new note of the stock "Basic" notetype to deck `deck_id`, generating
+/// its card(s) exactly like real Anki's "Add" dialog (`Collection::add_note`).
+/// `fields_ptr`/`fields_len` is a UTF-8 JSON array of field-value strings (in
+/// notetype field order); its length must match the Basic notetype's real field
+/// count (a mismatch is a clear error rather than a silent truncate/pad).
+///
+/// On success writes the new note's id to `wasm_last_result_*` as a JSON
+/// **string** (i64 id, same `Number.MAX_SAFE_INTEGER` reasoning as deck ids).
+/// Returns 0 on success, negative on error (see `wasm_last_error_*`).
+///
+/// # Safety
+/// `fields_ptr`/`fields_len` must describe a valid, readable UTF-8 byte slice
+/// (or `fields_len == 0`).
+#[no_mangle]
+pub unsafe extern "C" fn wasm_add_basic_note(
+    deck_id: i64,
+    fields_ptr: *const u8,
+    fields_len: usize,
+) -> i32 {
+    let json = match str_from_raw(fields_ptr, fields_len) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+    let fields: Vec<String> = match serde_json::from_str(&json) {
+        Ok(f) => f,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+
+    let mut guard = match collection_slot().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            set_last_error("internal lock poisoned");
+            return -2;
+        }
+    };
+    let col = match guard.as_mut() {
+        Some(c) => c,
+        None => {
+            set_last_error("no collection open; call wasm_open_collection first");
+            return -1;
+        }
+    };
+
+    let notetype = match col.get_notetype_by_name("Basic") {
+        Ok(Some(nt)) => nt,
+        Ok(None) => {
+            set_last_error("stock 'Basic' notetype not found in collection");
+            return -3;
+        }
+        Err(e) => {
+            set_last_error(e);
+            return -3;
+        }
+    };
+
+    if fields.len() != notetype.fields.len() {
+        set_last_error(format!(
+            "expected {} field value(s) for the 'Basic' notetype, got {}",
+            notetype.fields.len(),
+            fields.len()
+        ));
+        return -1;
+    }
+
+    let mut note = Note::new(&notetype);
+    for (idx, value) in fields.iter().enumerate() {
+        if let Err(e) = note.set_field(idx, value) {
+            set_last_error(e);
+            return -4;
+        }
+    }
+
+    if let Err(e) = col.add_note(&mut note, DeckId(deck_id)) {
+        set_last_error(e);
+        return -5;
+    }
+
+    let json = serde_json::Value::String(note.id.0.to_string());
+    match serde_json::to_vec(&json) {
+        Ok(bytes) => {
+            set_last_result(bytes);
+            0
+        }
+        Err(e) => {
+            set_last_error(e);
+            -6
+        }
+    }
+}
+
+/// Lists the notes in deck `deck_id` (this deck only, **not** its child decks —
+/// `did:<id>` search syntax, confirmed in rslib's search parser). Backed by
+/// `Collection::search_notes_unordered`, the same real search real Anki's
+/// Browse screen uses.
+///
+/// Each entry is `{"noteId":"<id>","preview":"<text>"}` where `preview` is the
+/// note's *first* field value (empty string if the note somehow has zero
+/// fields). The first field is a simple, always-available stand-in for real
+/// Anki's "sort field" concept: the true sort field isn't reachable from
+/// outside the crate here, and for the stock notetypes (and the overwhelming
+/// majority of real ones) the sort field *is* the first field anyway.
+///
+/// A note that comes back `None` from storage (e.g. concurrently removed
+/// between the search and the fetch) is skipped rather than failing the whole
+/// list. `noteId` is a JSON **string** (i64, same reasoning as deck ids).
+/// Returns 0 on success, negative on error (see `wasm_last_error_*`).
+#[no_mangle]
+pub extern "C" fn wasm_list_notes_in_deck(deck_id: i64) -> i32 {
+    let mut guard = match collection_slot().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            set_last_error("internal lock poisoned");
+            return -2;
+        }
+    };
+    let col = match guard.as_mut() {
+        Some(c) => c,
+        None => {
+            set_last_error("no collection open; call wasm_open_collection first");
+            return -1;
+        }
+    };
+
+    let nids = match col.search_notes_unordered(&format!("did:{deck_id}")) {
+        Ok(n) => n,
+        Err(e) => {
+            set_last_error(e);
+            return -3;
+        }
+    };
+
+    let mut entries: Vec<serde_json::Value> = Vec::with_capacity(nids.len());
+    for nid in nids {
+        match col.storage.get_note(nid) {
+            Ok(Some(note)) => {
+                let preview = note.fields().first().cloned().unwrap_or_default();
+                entries.push(serde_json::json!({
+                    "noteId": nid.0.to_string(),
+                    "preview": preview,
+                }));
+            }
+            // Concurrently removed between search and fetch — skip, don't fail
+            // the whole list.
+            Ok(None) => continue,
+            Err(e) => {
+                set_last_error(e);
+                return -4;
+            }
+        }
+    }
+
+    match serde_json::to_vec(&entries) {
+        Ok(bytes) => {
+            set_last_result(bytes);
+            0
+        }
+        Err(e) => {
+            set_last_error(e);
+            -5
+        }
+    }
+}
+
+/// Fetches a single note's editable content: its id, its notetype id, and
+/// parallel `fieldNames`/`fields` arrays (same order and length) so the
+/// (follow-up) Edit UI can label each input with the note's *real* field name
+/// regardless of notetype. This is the notetype-agnostic path that must work on
+/// notes from any imported `.apkg`, so field names are read live from the
+/// note's own notetype (`Collection::get_notetype`), never hardcoded.
+///
+/// Both `noteId` and `notetypeId` are JSON **strings** (i64, same reasoning as
+/// deck ids). A missing note, or a note whose notetype can't be found, is a
+/// real error. Returns 0 on success, negative on error (see `wasm_last_error_*`).
+#[no_mangle]
+pub extern "C" fn wasm_get_note(note_id: i64) -> i32 {
+    let mut guard = match collection_slot().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            set_last_error("internal lock poisoned");
+            return -2;
+        }
+    };
+    let col = match guard.as_mut() {
+        Some(c) => c,
+        None => {
+            set_last_error("no collection open; call wasm_open_collection first");
+            return -1;
+        }
+    };
+
+    let note = match col.storage.get_note(NoteId(note_id)) {
+        Ok(Some(n)) => n,
+        Ok(None) => {
+            set_last_error(format!("note not found: {note_id}"));
+            return -3;
+        }
+        Err(e) => {
+            set_last_error(e);
+            return -4;
+        }
+    };
+
+    let notetype = match col.get_notetype(note.notetype_id) {
+        Ok(Some(nt)) => nt,
+        Ok(None) => {
+            set_last_error(format!(
+                "notetype {} for note {note_id} not found",
+                note.notetype_id.0
+            ));
+            return -5;
+        }
+        Err(e) => {
+            set_last_error(e);
+            return -5;
+        }
+    };
+
+    let field_names: Vec<&str> = notetype.fields.iter().map(|f| f.name.as_str()).collect();
+    let payload = serde_json::json!({
+        "noteId": note.id.0.to_string(),
+        "notetypeId": note.notetype_id.0.to_string(),
+        "fieldNames": field_names,
+        "fields": note.fields(),
+    });
+
+    match serde_json::to_vec(&payload) {
+        Ok(bytes) => {
+            set_last_result(bytes);
+            0
+        }
+        Err(e) => {
+            set_last_error(e);
+            -6
+        }
+    }
+}
+
+/// Saves edited field values back to note `note_id` (`Collection::update_note`,
+/// the same call real Anki's Edit dialog makes). `fields_ptr`/`fields_len` is a
+/// UTF-8 JSON array of field-value strings, in field order; its length must
+/// match the note's actual field count (a mismatch is a clear error rather than
+/// silently truncating extras or leaving fields unset — this path is
+/// notetype-agnostic and must not corrupt notes from imported decks).
+///
+/// Returns 0 on success, negative on error (see `wasm_last_error_*`).
+///
+/// # Safety
+/// `fields_ptr`/`fields_len` must describe a valid, readable UTF-8 byte slice
+/// (or `fields_len == 0`).
+#[no_mangle]
+pub unsafe extern "C" fn wasm_update_note_fields(
+    note_id: i64,
+    fields_ptr: *const u8,
+    fields_len: usize,
+) -> i32 {
+    let json = match str_from_raw(fields_ptr, fields_len) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+    let fields: Vec<String> = match serde_json::from_str(&json) {
+        Ok(f) => f,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+
+    let mut guard = match collection_slot().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            set_last_error("internal lock poisoned");
+            return -2;
+        }
+    };
+    let col = match guard.as_mut() {
+        Some(c) => c,
+        None => {
+            set_last_error("no collection open; call wasm_open_collection first");
+            return -1;
+        }
+    };
+
+    let mut note = match col.storage.get_note(NoteId(note_id)) {
+        Ok(Some(n)) => n,
+        Ok(None) => {
+            set_last_error(format!("note not found: {note_id}"));
+            return -3;
+        }
+        Err(e) => {
+            set_last_error(e);
+            return -4;
+        }
+    };
+
+    if fields.len() != note.fields().len() {
+        set_last_error(format!(
+            "expected {} field value(s) for note {note_id}, got {}",
+            note.fields().len(),
+            fields.len()
+        ));
+        return -1;
+    }
+
+    for (idx, value) in fields.iter().enumerate() {
+        if let Err(e) = note.set_field(idx, value) {
+            set_last_error(e);
+            return -5;
+        }
+    }
+
+    match col.update_note(&mut note) {
+        Ok(_) => 0,
+        Err(e) => {
+            set_last_error(e);
+            -6
         }
     }
 }

@@ -156,6 +156,52 @@ export interface MediaCheckReport {
   trashBytes: number
 }
 
+/** The stock "Basic" notetype's id and its real field names (queried live from
+ * rslib, not hardcoded — see `getBasicNotetypeInfo`). `notetypeId` is a
+ * `bigint` for the same `Number.MAX_SAFE_INTEGER` reason as `Deck.id`. */
+export interface BasicNotetypeInfo {
+  notetypeId: bigint
+  fieldNames: string[]
+}
+
+/** One note as returned by `listNotesInDeck`. `preview` is the note's first
+ * field value (a stand-in for real Anki's sort field — see
+ * `wasm_list_notes_in_deck`'s doc comment in main.rs). `noteId` is a `bigint`
+ * (i64, same reasoning as `Deck.id`). */
+export interface NotePreview {
+  noteId: bigint
+  preview: string
+}
+
+/** A single note's editable content from `getNote`. `fieldNames` and `fields`
+ * are parallel arrays (same order/length) so the UI can label each field input
+ * with its real name for *any* notetype. Both ids are `bigint` (i64). */
+export interface NoteDetail {
+  noteId: bigint
+  notetypeId: bigint
+  fieldNames: string[]
+  fields: string[]
+}
+
+/** Raw JSON shapes the note-CRUD bridge exports write (ids as strings, same
+ * `Number.MAX_SAFE_INTEGER` concern as `listDecks`/`Deck.id`). */
+interface RawBasicNotetypeInfo {
+  notetypeId: string
+  fieldNames: string[]
+}
+
+interface RawNotePreview {
+  noteId: string
+  preview: string
+}
+
+interface RawNoteDetail {
+  noteId: string
+  notetypeId: string
+  fieldNames: string[]
+  fields: string[]
+}
+
 /** Raw shape of the object Emscripten's MODULARIZE factory resolves to.
  * Only the pieces this module actually touches are declared. */
 interface EmscriptenModule {
@@ -177,6 +223,13 @@ interface EmscriptenModule {
   _wasm_import_apkg(ptr: number, len: number): number
   _wasm_list_decks(): number
   _wasm_create_deck(ptr: number, len: number): number
+  _wasm_get_basic_notetype_info(): number
+  // `deckId`/`noteId` are genuine i64 parameters marshalled as BigInt (see the
+  // note on `_wasm_set_current_deck` above).
+  _wasm_add_basic_note(deckId: bigint, fieldsPtr: number, fieldsLen: number): number
+  _wasm_list_notes_in_deck(deckId: bigint): number
+  _wasm_get_note(noteId: bigint): number
+  _wasm_update_note_fields(noteId: bigint, fieldsPtr: number, fieldsLen: number): number
   _wasm_get_deck_tree(): number
   _wasm_get_stats(): number
   _wasm_reset_progress(): number
@@ -510,6 +563,102 @@ export async function createDeck(name: string): Promise<bigint> {
     throw new Error(`wasm_create_deck failed (${rc}): ${readLastError(mod)}`)
   }
   return BigInt(JSON.parse(readLastResult(mod)) as string)
+}
+
+/**
+ * Fetches the stock "Basic" notetype's id and its real field names (e.g.
+ * `["Front", "Back"]`, but read live from rslib — not hardcoded, so a
+ * customized Basic notetype's actual names come through). Used by the
+ * (follow-up) Add-note UI to label its field inputs and to know how many
+ * values `addBasicNote` expects.
+ */
+export async function getBasicNotetypeInfo(): Promise<BasicNotetypeInfo> {
+  const mod = await loadModule()
+  const rc = mod._wasm_get_basic_notetype_info()
+  if (rc !== 0) {
+    throw new Error(`wasm_get_basic_notetype_info failed (${rc}): ${readLastError(mod)}`)
+  }
+  const raw = JSON.parse(readLastResult(mod)) as RawBasicNotetypeInfo
+  return { notetypeId: BigInt(raw.notetypeId), fieldNames: raw.fieldNames }
+}
+
+/**
+ * Adds a new note of the stock "Basic" notetype to `deckId`, generating its
+ * card(s) exactly like real Anki's "Add" dialog. `fields` are the field values
+ * in notetype field order; its length must match the Basic notetype's field
+ * count (see `getBasicNotetypeInfo`) or the bridge rejects it. Returns the new
+ * note's id as a `bigint`.
+ *
+ * Callers should call `persistCollection()` afterwards, same as every other
+ * mutating call in this app.
+ */
+export async function addBasicNote(deckId: bigint, fields: string[]): Promise<bigint> {
+  const mod = await loadModule()
+  const fieldsBytes = new TextEncoder().encode(JSON.stringify(fields))
+  const rc = withWasmBuffer(mod, fieldsBytes, (ptr, len) =>
+    mod._wasm_add_basic_note(deckId, ptr, len),
+  )
+  if (rc !== 0) {
+    throw new Error(`wasm_add_basic_note failed (${rc}): ${readLastError(mod)}`)
+  }
+  return BigInt(JSON.parse(readLastResult(mod)) as string)
+}
+
+/**
+ * Lists the notes in `deckId` (this deck only, not its child decks) — backed
+ * by the same real Anki search that powers the Browse screen. Each entry has
+ * the note's id and a `preview` (its first field value). Returns `[]` for an
+ * empty deck.
+ */
+export async function listNotesInDeck(deckId: bigint): Promise<NotePreview[]> {
+  const mod = await loadModule()
+  const rc = mod._wasm_list_notes_in_deck(deckId)
+  if (rc !== 0) {
+    throw new Error(`wasm_list_notes_in_deck failed (${rc}): ${readLastError(mod)}`)
+  }
+  const raw = JSON.parse(readLastResult(mod)) as RawNotePreview[]
+  return raw.map((n) => ({ noteId: BigInt(n.noteId), preview: n.preview }))
+}
+
+/**
+ * Fetches a single note's editable content: its id, notetype id, and parallel
+ * `fieldNames`/`fields` arrays. Works for *any* notetype (field names are read
+ * live from the note's own notetype), so it's safe on notes from imported
+ * decks, not just app-created ones. Throws if the note doesn't exist.
+ */
+export async function getNote(noteId: bigint): Promise<NoteDetail> {
+  const mod = await loadModule()
+  const rc = mod._wasm_get_note(noteId)
+  if (rc !== 0) {
+    throw new Error(`wasm_get_note failed (${rc}): ${readLastError(mod)}`)
+  }
+  const raw = JSON.parse(readLastResult(mod)) as RawNoteDetail
+  return {
+    noteId: BigInt(raw.noteId),
+    notetypeId: BigInt(raw.notetypeId),
+    fieldNames: raw.fieldNames,
+    fields: raw.fields,
+  }
+}
+
+/**
+ * Saves edited field values back to `noteId` (real Anki's Edit-dialog call).
+ * `fields` are the new values in field order; its length must match the note's
+ * actual field count (see `getNote`) or the bridge rejects it — it never
+ * silently truncates or leaves fields unset. Works for any notetype.
+ *
+ * Callers should call `persistCollection()` afterwards, same as every other
+ * mutating call in this app.
+ */
+export async function updateNoteFields(noteId: bigint, fields: string[]): Promise<void> {
+  const mod = await loadModule()
+  const fieldsBytes = new TextEncoder().encode(JSON.stringify(fields))
+  const rc = withWasmBuffer(mod, fieldsBytes, (ptr, len) =>
+    mod._wasm_update_note_fields(noteId, ptr, len),
+  )
+  if (rc !== 0) {
+    throw new Error(`wasm_update_note_fields failed (${rc}): ${readLastError(mod)}`)
+  }
 }
 
 /** Raw JSON shape `wasm_get_deck_tree` writes (`deckId` as a string, same
