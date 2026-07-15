@@ -2153,3 +2153,103 @@ change; patch file regenerated). Re-verified the same way: header now reads
 `"26.05,,wasm"` — will display as "wasm · Anki 26.05" in the device list.
 
 Full test suite (33/33), `tsc --noEmit`, and a fresh build all clean.
+
+## 27. 2026-07-15 — Media sync was slow every time: the tracking DB was never persisted (and restoring it safely needed a second fix)
+
+The user reported that "Sync now" always sits on "syncing media" for a
+noticeable while, even right after a sync that had nothing new to transfer.
+This is exactly the "known, accepted limitation" flagged (but not yet fixed)
+in §25: `collection.mdb` — the media sync protocol's own change-tracking
+database, a completely separate database and protocol from collection sync
+— was never persisted to OPFS, only the media *files* were.
+
+**Root-caused precisely**, not just re-confirmed the old guess. Read
+`MediaSyncer::sync_inner` (`rslib/src/sync/media/syncer.rs`):
+
+```rust
+let meta = self.mgr.db.get_meta()?;
+let client_usn = meta.last_sync_usn;      // always 0 — mdb never persisted
+...
+if client_usn != server_usn {              // always true once the server has synced before
+    self.fetch_changes(meta).await?;       // walks the server's FULL media change
+}                                           // history from usn 0, batch by batch
+```
+
+Since `collection.mdb` reset to empty every session, `client_usn` was always
+0. Any server that had ever synced before (from Anki desktop, say) reports a
+nonzero `server_usn`, so `client_usn != server_usn` was *always* true —
+every single "Sync now" walked the server's entire media change history
+from scratch via paginated `mediaChanges` calls, regardless of how small the
+actual delta was. This has nothing to do with hashing files (that part was
+already measured as cheap, §13: ~30ms/~188ms for ~7000 files) — it's a
+network-protocol-level "start from zero" problem, and persisting
+`last_sync_usn` across sessions is the actual fix.
+
+**The genuinely dangerous part, found by reading `ChangeTracker::register_changes`
+before writing any code, not after**: `MediaSyncer::sync_inner` starts by
+calling `register_changes()`, which walks the *local* media folder on disk
+and reconciles it against whatever `collection.mdb` currently has recorded.
+Any file the db recorded that ISN'T found on disk gets marked *removed* —
+and if changes are pending, `send_changes()` uploads that removal to the
+server. `restoreMediaToBackend()` (the media *files* → MEMFS restore) has
+always been a deliberate, non-automatic call — §13 explicitly kept it off
+the page-load hot path to avoid rehydrating thousands of files for no
+display benefit — and `syncMediaAfterCollectionSync` never called it either.
+So: persisting `collection.mdb` *alone*, without also restoring the media
+files into MEMFS first, would have made `register_changes` conclude every
+previously-known file had been deleted on the very first sync of a new
+session — and then propagate that as a real deletion to the server. This
+would have been a silent data-loss bug shipped in the name of a performance
+fix. Caught before writing any UI-facing code by reading the sync engine's
+actual reconciliation logic first, not by trial and error against a live
+server (this sandbox can't reach the user's, and no real AnkiWeb credentials
+are available here either).
+
+**Implementation**, two coupled changes (either alone is wrong):
+
+1. **Persist `collection.mdb`.** Its connection is short-lived (opened fresh
+   and dropped inside every `wasm_sync_media`/`wasm_import_apkg` call, unlike
+   the collection's own connection which stays open all session), so instead
+   of trusting sqlite's close-time auto-checkpoint behavior, added an
+   explicit, verifiable checkpoint — mirroring the exact precedent already
+   set for the collection itself (`SqliteStorage::checkpoint`, widened from
+   `pub(crate)` to `pub` in §15). Added `MediaDatabase::checkpoint()`
+   (`rslib/src/sync/media/database/client/mod.rs`) and
+   `MediaManager::checkpoint()` (`rslib/src/media/mod.rs`), both copying the
+   collection version's `pragma wal_checkpoint(truncate)` logic verbatim.
+   New wasm export `wasm_checkpoint_media_db()` (`rust/wasm-bridge/src/main.rs`)
+   opens (or creates) a `MediaManager` purely to call it — WAL checkpointing
+   is a property of the database *file*, not the specific connection that
+   wrote to it, so a fresh connection can still flush an older connection's
+   WAL. `web/src/wasm/backend.ts` gained `readMediaDbBytes()`/
+   `writeMediaDbBytes()` (direct `FS.readFile`/`writeFile` at
+   `/anki/collection.mdb`, same pattern as `readCollectionBytes`, no new
+   Rust plumbing needed for the actual byte shuttle) and `db/collection.ts`
+   gained `persistMediaDb()`/`restoreMediaDbToBackend()`. Restore runs once
+   in `ensureCollectionReady`, right after `openCollection` (which creates
+   `/anki`); persist runs after `syncMedia()` and after `importApkg()` (import
+   registers files into the same db).
+
+2. **Restore media files before every media sync.** `syncMediaAfterCollectionSync`
+   (`ui/SyncSettings/index.tsx`) now calls the already-existing
+   `restoreMediaToBackend()` immediately before `syncMedia()` — previously
+   only used for rslib operations that read media bytes, now also required
+   for correctness once the tracking DB persists. Cost is the same one
+   already measured in §13 (sub-200ms for ~7000 files) and only runs on the
+   user's deliberate "Sync now" click, not on page load, so the §13 rationale
+   for keeping it off the hot path still holds.
+
+**Verified**, without a reachable real sync server (same sandbox limitation
+as §20-25): wrote
+`rust/wasm-bridge/smoke-test/media_db_persist_test.mjs`, which (a) confirms
+`wasm_checkpoint_media_db` is a harmless no-op-creating call on a collection
+that's never touched media, (b) imports a real fixture with media
+(`pylib/tests/support/media.apkg`) and confirms `collection.mdb` is a
+non-empty, valid `SQLite format 3` file afterward, and (c) — the critical
+check — copies those bytes plus the media files into a **second, independent
+wasm instance** (fresh MEMFS, simulating a page reload) and confirms sqlite
+can actually reopen the restored `.mdb` file cleanly. All three passed. Full
+test suite (33/33), `tsc --noEmit`, and a fresh build all clean. **Not
+verified**: an actual two-session sync against a real server showing a
+faster second sync — the user is best positioned to confirm "Sync now" feels
+snappier on a second run with nothing new to transfer.

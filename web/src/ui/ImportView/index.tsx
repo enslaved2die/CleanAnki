@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { motion } from 'framer-motion'
 import { importApkg, listDecks, setCurrentDeck } from '../../wasm/backend'
-import { ensureCollectionReady, persistCollection, persistMedia } from '../../db/collection'
+import {
+  ensureCollectionReady,
+  persistCollection,
+  persistMedia,
+  persistMediaDb,
+} from '../../db/collection'
 
 type Status = 'loading' | 'ready' | 'importing' | 'error'
 
@@ -61,6 +66,11 @@ export default function ImportView() {
           `[import] persisted ${mediaCount} media files to OPFS in ${(performance.now() - mediaT0).toFixed(0)}ms`,
         )
       }
+      // import_apkg registers imported files in the media sync tracking
+      // database too (same one `syncMedia` uses) — persist it so a later
+      // session's first sync already knows about them instead of relying
+      // solely on the folder-mtime rescan to rediscover them.
+      await persistMediaDb()
 
       const updated = await listDecks()
       setLastImportMs(elapsed)

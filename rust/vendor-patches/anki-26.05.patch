@@ -100,6 +100,25 @@ index 1dbc57a..cf32205 100644
              .clone()
      }
  
+diff --git a/rslib/src/media/mod.rs b/rslib/src/media/mod.rs
+index 8a599fb..d24c92a 100644
+--- a/rslib/src/media/mod.rs
++++ b/rslib/src/media/mod.rs
+@@ -89,6 +89,14 @@ impl MediaManager {
+         })
+     }
+ 
++    /// Flush the tracking database's WAL into its main file. See
++    /// `MediaDatabase::checkpoint`'s doc comment for why the CleanAnki wasm
++    /// bridge needs this (persisting `collection.mdb` to OPFS across
++    /// sessions).
++    pub fn checkpoint(&self) -> Result<()> {
++        self.db.checkpoint()
++    }
++
+     pub fn remove_files<S>(&self, filenames: &[S]) -> Result<()>
+     where
+         S: AsRef<str> + std::fmt::Debug,
 diff --git a/rslib/src/scheduler/mod.rs b/rslib/src/scheduler/mod.rs
 index 93aee3c..92818cc 100644
 --- a/rslib/src/scheduler/mod.rs
@@ -348,6 +367,56 @@ index 602b672..0c67819 100644
  }
  
  /// Reqwest can't retry a redirected request as the body has been consumed, so
+diff --git a/rslib/src/sync/media/database/client/mod.rs b/rslib/src/sync/media/database/client/mod.rs
+index fe3e7c8..b779634 100644
+--- a/rslib/src/sync/media/database/client/mod.rs
++++ b/rslib/src/sync/media/database/client/mod.rs
+@@ -11,6 +11,7 @@ use rusqlite::Row;
+ use tracing::debug;
+ 
+ use crate::error;
++use crate::error::DbErrorKind;
+ use crate::media::files::AddedFile;
+ use crate::media::Sha1Hash;
+ use crate::prelude::Usn;
+@@ -60,6 +61,37 @@ impl MediaDatabase {
+         })
+     }
+ 
++    /// Flush the WAL into the main `.mdb` file, mirroring
++    /// `SqliteStorage::checkpoint` (see storage/sqlite.rs) — added (not
++    /// `pub(crate)`) for the CleanAnki wasm bridge, which persists this
++    /// tracking database to OPFS across browser sessions the same way it
++    /// already does the collection itself. Without this, whatever's still
++    /// in the never-persisted `-wal` sidecar (e.g. `last_sync_usn`, the
++    /// per-file mtimes/checksums `register_changes` relies on) is lost on
++    /// reload, forcing every session's media sync to reconcile from scratch
++    /// instead of picking up where the last one left off. See
++    /// docs/ARCHITECTURE.md.
++    pub fn checkpoint(&self) -> error::Result<()> {
++        if !self.db.is_autocommit() {
++            return Err(AnkiError::db_error(
++                "active transaction",
++                DbErrorKind::Other,
++            ));
++        }
++        self.db
++            .query_row_and_then("pragma wal_checkpoint(truncate)", [], |row| {
++                let error_code: i64 = row.get(0)?;
++                if error_code != 0 {
++                    Err(AnkiError::db_error(
++                        "unable to checkpoint",
++                        DbErrorKind::Other,
++                    ))
++                } else {
++                    Ok(())
++                }
++            })
++    }
++
+     /// Execute the provided closure in a transaction, rolling back if
+     /// an error is returned.
+     pub(crate) fn transact<F, R>(&self, func: F) -> error::Result<R>
 diff --git a/rslib/src/sync/mod.rs b/rslib/src/sync/mod.rs
 index 447c6f3..255ce91 100644
 --- a/rslib/src/sync/mod.rs

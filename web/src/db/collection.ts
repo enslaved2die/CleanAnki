@@ -19,10 +19,17 @@ import {
   listMediaFiles,
   readMediaFile,
   writeMediaFile,
+  readMediaDbBytes,
+  writeMediaDbBytes,
 } from '../wasm/backend'
 
 /** Filename the collection is persisted under at the root of OPFS. */
 const COLLECTION_OPFS_FILENAME = 'collection.anki2'
+
+/** Filename the media sync tracking database is persisted under at the root
+ * of OPFS — a completely separate database from the collection itself (see
+ * `readMediaDbBytes` in wasm/backend.ts). */
+const MEDIA_DB_OPFS_FILENAME = 'collection.mdb'
 
 /** Bundled fixture used to seed OPFS on first launch (before any real
  * collection has been synced/imported). Served from public/wasm/ — see
@@ -102,6 +109,40 @@ export async function restoreMediaToBackend(): Promise<number> {
   return names.length
 }
 
+/**
+ * Persists the media *sync tracking database*'s current bytes to OPFS — a
+ * completely separate database from the collection and from the media files
+ * themselves (see `readMediaDbBytes`'s doc comment in wasm/backend.ts). Call
+ * after any operation that touches it (`syncMedia`, `importApkg`); without
+ * this, `last_sync_usn` and every file's last-known checksum are lost on
+ * reload, forcing the next media sync to reconcile the entire library
+ * against the server from scratch instead of just what's actually changed.
+ *
+ * A `null` result (nothing to persist yet — no media sync/import has run
+ * this collection's lifetime) is a normal no-op, not an error.
+ */
+export async function persistMediaDb(): Promise<void> {
+  const bytes = await readMediaDbBytes()
+  if (bytes) await writeOpfsFile(MEDIA_DB_OPFS_FILENAME, bytes)
+}
+
+/**
+ * Restores the media tracking database persisted by `persistMediaDb()` back
+ * into the backend's virtual FS. Call once during collection bootstrap
+ * (`ensureCollectionReady`, right after `openCollection`) — unlike
+ * `restoreMediaToBackend` (the media *files*, deliberately NOT restored
+ * eagerly since rehydrating thousands of files would stall the first
+ * render), this is a single small file and cheap to restore unconditionally.
+ * A first-ever launch (nothing persisted yet) is a normal no-op: the next
+ * `col.media()` call creates a fresh database, exactly as it always has.
+ */
+export async function restoreMediaDbToBackend(): Promise<void> {
+  if (await opfsFileExists(MEDIA_DB_OPFS_FILENAME)) {
+    const bytes = await readOpfsFile(MEDIA_DB_OPFS_FILENAME)
+    await writeMediaDbBytes(bytes)
+  }
+}
+
 // Shared bootstrap so any view (StudyView, the import/deck-picker UI) can
 // safely assume the backend is initialised and a collection is open,
 // regardless of which one happens to mount first — App.tsx mounts exactly
@@ -118,6 +159,10 @@ export async function ensureCollectionReady(): Promise<void> {
     await initBackend()
     const bytes = await loadInitialCollectionBytes()
     await openCollection(bytes)
+    // Restore any previously-persisted media tracking DB before anything
+    // else can call `col.media()` (import, sync) and create a fresh, empty
+    // one at the same path instead.
+    await restoreMediaDbToBackend()
     // Persist right away: if this launch bootstrapped from the bundled
     // starter fixture, OPFS now has its own copy so future launches resume
     // from OPFS instead of re-seeding from the fixture.

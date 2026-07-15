@@ -79,6 +79,15 @@ const IMPORT_APKG_PATH: &str = "/anki/import.apkg";
 /// so JS can shuttle them to/from OPFS (MEMFS is wiped on every page reload).
 const MEDIA_FOLDER: &str = "/anki/collection.media";
 
+// The media tracking database (change-tracking DB for the *media* sync
+// protocol — entirely separate from the collection itself) lives at
+// `/anki/collection.mdb`, same derivation as `MEDIA_FOLDER`:
+// `col_path.with_extension("mdb")`. No Rust-side constant for it — every
+// access goes through `Collection::media()`, which derives the path itself;
+// JS persists it to OPFS via `wasm_checkpoint_media_db` + direct
+// `FS.readFile`/`writeFile` calls at that same well-known path — see
+// docs/ARCHITECTURE.md.
+
 // rslib's public API is `&mut self` methods on `Collection`, and free wasm
 // functions have no receiver, so we stash process-global state. wasm is
 // effectively single-threaded from the JS entry point (emscripten pthreads
@@ -375,6 +384,57 @@ pub extern "C" fn wasm_checkpoint() -> i32 {
         Err(e) => {
             set_last_error(e);
             -3
+        }
+    }
+}
+
+/// Flush the *media* tracking database's WAL into `MEDIA_DB_PATH`, exactly
+/// like `wasm_checkpoint` does for the collection itself. Call this after a
+/// successful `wasm_sync_media` (or `wasm_import_apkg`, which also mutates
+/// this database) and before reading `MEDIA_DB_PATH` out of the virtual FS to
+/// persist it to OPFS — otherwise `last_sync_usn` and the per-file
+/// mtimes/checksums `register_changes` relies on may still be sitting in the
+/// never-persisted `-wal` sidecar and get silently lost on reload, forcing
+/// every session's media sync to reconcile the whole library from scratch
+/// (`last_sync_usn` resets to 0) instead of picking up where the last one
+/// left off. See docs/ARCHITECTURE.md.
+///
+/// Returns 0 on success, negative on error. Opens (creating if necessary) a
+/// short-lived `MediaManager` purely to run the checkpoint pragma — the
+/// connection that actually performed the sync/import has already been
+/// dropped by the time JS calls this, but WAL checkpointing operates on the
+/// database *file*, not a specific connection, so any connection to the same
+/// path can request one.
+#[no_mangle]
+pub extern "C" fn wasm_checkpoint_media_db() -> i32 {
+    let guard = match collection_slot().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            set_last_error("internal lock poisoned");
+            return -2;
+        }
+    };
+    let col = match guard.as_ref() {
+        Some(c) => c,
+        None => {
+            set_last_error("no collection open; call wasm_open_collection first");
+            return -1;
+        }
+    };
+
+    let mgr = match col.media() {
+        Ok(m) => m,
+        Err(e) => {
+            set_last_error(e);
+            return -3;
+        }
+    };
+
+    match mgr.checkpoint() {
+        Ok(()) => 0,
+        Err(e) => {
+            set_last_error(e);
+            -4
         }
     }
 }

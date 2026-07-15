@@ -59,6 +59,7 @@ fn main() {
         "_wasm_init_backend",
         "_wasm_open_collection",
         "_wasm_checkpoint",
+        "_wasm_checkpoint_media_db",
         "_wasm_import_apkg",
         "_wasm_list_decks",
         "_wasm_set_current_deck",

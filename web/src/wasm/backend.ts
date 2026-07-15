@@ -41,6 +41,13 @@ const GLOBAL_FACTORY_NAME = 'AnkiWasmBridgeModule'
  * Must match `COLLECTION_PATH` in rust/wasm-bridge/src/main.rs exactly. */
 const COLLECTION_PATH = '/anki/collection.anki2'
 
+/** The media sync protocol's change-tracking database — a completely
+ * separate database from the collection itself. Must match `MEDIA_DB_PATH`
+ * in rust/wasm-bridge/src/main.rs exactly (derived there from
+ * `COLLECTION_PATH.with_extension("mdb")`, same convention desktop Anki
+ * uses). */
+const MEDIA_DB_PATH = '/anki/collection.mdb'
+
 /** Card returned by `get_next_card`. Just the id — the actual rendered
  * content is a separate round trip via `getCurrentCardContent()` (mirrors
  * the bridge: `wasm_get_next_card` only returns an id, `wasm_render_current_card`
@@ -131,6 +138,7 @@ interface EmscriptenModule {
   HEAPU8: Uint8Array
   FS: {
     readFile(path: string): Uint8Array
+    writeFile(path: string, data: Uint8Array): void
   }
   _wasm_alloc(len: number): number
   _wasm_dealloc(ptr: number, len: number): void
@@ -141,6 +149,7 @@ interface EmscriptenModule {
   _wasm_init_backend(): number
   _wasm_open_collection(ptr: number, len: number): number
   _wasm_checkpoint(): number
+  _wasm_checkpoint_media_db(): number
   _wasm_import_apkg(ptr: number, len: number): number
   _wasm_list_decks(): number
   _wasm_get_deck_tree(): number
@@ -373,6 +382,53 @@ export async function readCollectionBytes(): Promise<Uint8Array> {
   // Defensive copy: `view` may be backed by wasm linear memory that a later
   // call (or a memory-growth reallocation) could invalidate.
   return new Uint8Array(view)
+}
+
+/**
+ * Reads the media sync tracking database's *current* bytes back out of
+ * Emscripten's virtual FS at `MEDIA_DB_PATH` — the same idea as
+ * `readCollectionBytes`, but for the completely separate database the media
+ * sync protocol uses to remember `last_sync_usn` and each file's last-known
+ * mtime/checksum (see `syncMedia`'s doc comment). Persisting this to OPFS
+ * (`persistMediaDb()` in db/collection.ts) and restoring it on the next
+ * session is what lets a repeat "Sync now" pick up from where the last one
+ * left off instead of re-fetching the server's entire media change history
+ * from scratch every time.
+ *
+ * Returns `null` if no media sync (or import) has touched the database yet
+ * this collection's lifetime — not an error, just "nothing to persist".
+ * Checkpoints the WAL first via `wasm_checkpoint_media_db`, mirroring
+ * `readCollectionBytes` (see rust/wasm-bridge/src/main.rs for why the
+ * short-lived `MediaManager` connection used for sync/import doesn't already
+ * guarantee this).
+ */
+export async function readMediaDbBytes(): Promise<Uint8Array | null> {
+  const mod = await loadModule()
+  const cp = mod._wasm_checkpoint_media_db()
+  if (cp !== 0) {
+    throw new Error(`wasm_checkpoint_media_db failed (${cp}): ${readLastError(mod)}`)
+  }
+  try {
+    const view = mod.FS.readFile(MEDIA_DB_PATH)
+    return new Uint8Array(view)
+  } catch (err) {
+    if (err && typeof err === 'object' && 'code' in err && err.code === 'ENOENT') {
+      return null
+    }
+    throw err
+  }
+}
+
+/**
+ * Restores previously-persisted media tracking database bytes into
+ * Emscripten's virtual FS at `MEDIA_DB_PATH`, before the first `col.media()`
+ * call of this session opens (and would otherwise create empty) that path.
+ * Call once during collection bootstrap, after `openCollection` (which
+ * creates `MEDIA_DB_PATH`'s parent directory).
+ */
+export async function writeMediaDbBytes(bytes: Uint8Array): Promise<void> {
+  const mod = await loadModule()
+  mod.FS.writeFile(MEDIA_DB_PATH, bytes)
 }
 
 /**

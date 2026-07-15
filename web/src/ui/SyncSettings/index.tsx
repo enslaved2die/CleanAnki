@@ -8,7 +8,12 @@ import {
   syncMedia,
   FullSyncRequiredError,
 } from '../../wasm/backend'
-import { persistCollection, persistMedia } from '../../db/collection'
+import {
+  persistCollection,
+  persistMedia,
+  persistMediaDb,
+  restoreMediaToBackend,
+} from '../../db/collection'
 
 // Real sync, wired to rslib's actual sync protocol via the wasm bridge (see
 // rust/wasm-bridge/src/main.rs `wasm_sync_login`/`wasm_sync_collection` and
@@ -116,12 +121,23 @@ export default function SyncSettings({
   // reference never actually get fetched. Deliberately does NOT throw: a
   // media-sync failure is surfaced as its own warning rather than making the
   // (already-successful) collection sync look like it failed too.
+  //
+  // `restoreMediaToBackend()` runs first and is NOT optional now that the
+  // tracking database persists across sessions (see `persistMediaDb`):
+  // rslib's `register_changes` reconciles its recorded file list against
+  // whatever it actually finds in the (emscripten) media folder, and MEMFS
+  // starts empty on every reload. Skipping the restore would make every file
+  // this database already knows about look locally deleted, which would
+  // propagate as real deletions to the server on the very next sync — this
+  // is a correctness fix, not just a speedup.
   const syncMediaAfterCollectionSync = async (currentHkey: string) => {
     setMediaSyncStatus('busy')
     setMediaSyncError(null)
     try {
+      await restoreMediaToBackend()
       await syncMedia(currentHkey, effectiveEndpoint)
       await persistMedia()
+      await persistMediaDb()
       setMediaSyncStatus('done')
     } catch (err) {
       setMediaSyncError(errorMessage(err))
