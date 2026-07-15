@@ -63,6 +63,7 @@ fn main() {
         "_wasm_import_apkg",
         "_wasm_list_decks",
         "_wasm_set_current_deck",
+        "_wasm_get_current_deck_id",
         "_wasm_delete_deck",
         "_wasm_get_deck_tree",
         "_wasm_create_deck",

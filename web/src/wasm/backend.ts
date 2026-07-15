@@ -238,6 +238,7 @@ interface EmscriptenModule {
   // *parameters* as native JS BigInt too, the same as it does for
   // wasm_get_next_card's i64 *return*. See docs/ARCHITECTURE.md §10.
   _wasm_set_current_deck(deckId: bigint): number
+  _wasm_get_current_deck_id(): number
   _wasm_delete_deck(deckId: bigint): number
   _wasm_list_media_files(): number
   _wasm_check_media(): number
@@ -739,6 +740,22 @@ export async function setCurrentDeck(deckId: bigint): Promise<void> {
   if (rc !== 0) {
     throw new Error(`wasm_set_current_deck failed (${rc}): ${readLastError(mod)}`)
   }
+}
+
+/**
+ * Returns the id of the deck `setCurrentDeck` most recently selected — real
+ * Anki's own "current deck" concept (`ConfigKey::CurrentDeckId`), not
+ * something this app tracks separately. Falls back to the built-in Default
+ * deck (id 1n) if nothing has ever been selected. Used to feature "the deck
+ * you were last studying" at the top of the Home dashboard.
+ */
+export async function getCurrentDeckId(): Promise<bigint> {
+  const mod = await loadModule()
+  const rc = mod._wasm_get_current_deck_id()
+  if (rc !== 0) {
+    throw new Error(`wasm_get_current_deck_id failed (${rc}): ${readLastError(mod)}`)
+  }
+  return BigInt(JSON.parse(readLastResult(mod)) as string)
 }
 
 /**

@@ -584,6 +584,52 @@ pub extern "C" fn wasm_set_current_deck(deck_id: i64) -> i32 {
     }
 }
 
+/// Returns the id of the "current deck" — the same real rslib concept
+/// `wasm_set_current_deck` writes to (`ConfigKey::CurrentDeckId`, real Anki's
+/// own notion of "whichever deck you last selected to study"), as a JSON
+/// string (same big-id-safe convention as every other id this bridge returns).
+/// Used to feature "the deck you were last studying" at the top of the Home
+/// dashboard. Falls back to the built-in Default deck (id 1) if nothing has
+/// ever been selected — `Collection::get_current_deck` already does that
+/// fallback itself, so this never errors on a fresh collection.
+#[no_mangle]
+pub extern "C" fn wasm_get_current_deck_id() -> i32 {
+    let mut guard = match collection_slot().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            set_last_error("internal lock poisoned");
+            return -2;
+        }
+    };
+    let col = match guard.as_mut() {
+        Some(c) => c,
+        None => {
+            set_last_error("no collection open; call wasm_open_collection first");
+            return -1;
+        }
+    };
+
+    let deck = match col.get_current_deck() {
+        Ok(d) => d,
+        Err(e) => {
+            set_last_error(e);
+            return -3;
+        }
+    };
+
+    let json = serde_json::Value::String(deck.id.0.to_string());
+    match serde_json::to_vec(&json) {
+        Ok(bytes) => {
+            set_last_result(bytes);
+            0
+        }
+        Err(e) => {
+            set_last_error(e);
+            -4
+        }
+    }
+}
+
 /// Deletes a deck **and all of its child decks**, along with every card (and
 /// any note left with no remaining cards) in all of them — this mirrors real
 /// Anki's actual behaviour (`Collection::remove_decks_and_child_decks`

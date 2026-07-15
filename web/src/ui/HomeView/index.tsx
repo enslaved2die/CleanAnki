@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { motion } from 'framer-motion'
-import { getDeckTree, setCurrentDeck, type DeckTreeNode } from '../../wasm/backend'
+import {
+  getDeckTree,
+  setCurrentDeck,
+  getCurrentDeckId,
+  type DeckTreeNode,
+} from '../../wasm/backend'
 import { ensureCollectionReady, persistCollection } from '../../db/collection'
 import type { StudyQueueInfo } from '../../App'
 
@@ -8,6 +13,35 @@ type Status = 'loading' | 'ready' | 'error'
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
+}
+
+/** True if `id` is `node` itself or anywhere in its subdeck subtree — used to
+ * find which *top-level* deck card should be featured when the real current
+ * deck (see `getCurrentDeckId`) turns out to be a nested subdeck rather than
+ * a top-level one. */
+function subtreeContains(node: DeckTreeNode, id: bigint): boolean {
+  if (node.deckId === id) return true
+  return node.children.some((child) => subtreeContains(child, id))
+}
+
+/**
+ * Reorders top-level decks so whichever one contains the real "current deck"
+ * (rslib's own concept — see `getCurrentDeckId`'s doc comment) comes first,
+ * i.e. gets featured. Falls back to leaving the order alone (today's first
+ * deck stays featured) if the current deck doesn't match anything here — a
+ * freshly-deleted deck, or a `currentDeckId` we haven't fetched yet.
+ */
+function withCurrentDeckFirst(
+  decks: DeckTreeNode[],
+  currentDeckId: bigint | null,
+): DeckTreeNode[] {
+  if (currentDeckId === null) return decks
+  const index = decks.findIndex((node) => subtreeContains(node, currentDeckId))
+  if (index <= 0) return decks
+  const reordered = decks.slice()
+  const [current] = reordered.splice(index, 1)
+  reordered.unshift(current)
+  return reordered
 }
 
 /** Cycled by deck position so cards read as distinct decks at a glance
@@ -43,11 +77,13 @@ export default function HomeView({
   const [status, setStatus] = useState<Status>('loading')
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const [tree, setTree] = useState<DeckTreeNode | null>(null)
+  const [currentDeckId, setCurrentDeckId] = useState<bigint | null>(null)
   const bootstrapped = useRef(false)
 
   const refresh = useCallback(async () => {
-    const t = await getDeckTree()
+    const [t, curId] = await Promise.all([getDeckTree(), getCurrentDeckId()])
     setTree(t)
+    setCurrentDeckId(curId)
     return t
   }, [])
 
@@ -124,14 +160,12 @@ export default function HomeView({
            * opens up into a 2-column grid once there's actually enough width
            * for it (`sm` up) rather than staying single-column forever. */}
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            {tree.children.map((node, index) => {
+            {withCurrentDeckFirst(tree.children, currentDeckId).map((node, index) => {
               const due = node.newCount + node.learnCount + node.reviewCount
-              // The first deck in the list is rendered "featured" (bigger
-              // padding/text, spans both grid columns), giving the stack the
-              // same slightly-expanded top-card look as the reference
-              // screenshots. Simplest stable choice: whatever rslib returns
-              // first, rather than re-sorting by due count and shuffling card
-              // positions as counts change during a study session.
+              // The deck containing the real "current deck" (whichever one
+              // was last selected via `setCurrentDeck` — see
+              // `getCurrentDeckId`) is featured: sorted first, bigger
+              // padding/text, spans both grid columns.
               const featured = index === 0
               const gradient = DECK_CARD_GRADIENTS[index % DECK_CARD_GRADIENTS.length]
 
