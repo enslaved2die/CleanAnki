@@ -9,6 +9,7 @@ import {
 } from '../../wasm/backend'
 import { ensureCollectionReady, persistCollection } from '../../db/collection'
 import ImportView from '../ImportView'
+import type { StudyQueueInfo } from '../../App'
 
 type Status = 'loading' | 'ready' | 'error'
 
@@ -117,7 +118,7 @@ function DeckRow({
 export default function DecksView({
   onStudyDeck,
 }: {
-  onStudyDeck: (total: number) => void
+  onStudyDeck: (queue: StudyQueueInfo) => void
 }) {
   const [status, setStatus] = useState<Status>('loading')
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
@@ -156,7 +157,12 @@ export default function DecksView({
       try {
         await setCurrentDeck(node.deckId)
         await persistCollection()
-        onStudyDeck(node.newCount + node.learnCount + node.reviewCount)
+        onStudyDeck({
+          total: node.newCount + node.learnCount + node.reviewCount,
+          newCount: node.newCount,
+          learnCount: node.learnCount,
+          reviewCount: node.reviewCount,
+        })
       } catch (err) {
         setErrorMsg(errorMessage(err))
         setStatus('error')

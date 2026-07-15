@@ -7,6 +7,16 @@ import ProfileView from './ui/ProfileView'
 
 type View = 'home' | 'study' | 'decks' | 'profile'
 
+/** Shape of a "go study" hand-off, carrying the new/learn/review breakdown
+ * (not just a bare total) so StudyView can render its own queue-composition
+ * UI (e.g. per-bucket colored segments) without re-deriving it. */
+export interface StudyQueueInfo {
+  total: number
+  newCount: number
+  learnCount: number
+  reviewCount: number
+}
+
 /** Tiny hand-drawn line-art icons — no icon library exists in this project
  * (only framer-motion/react/tailwind are dependencies), so these are inline
  * SVGs matched to a consistent stroke width/viewBox rather than pulled in
@@ -25,25 +35,6 @@ function HomeIcon({ className }: { className?: string }) {
     >
       <path d="M4 11.5 12 4l8 7.5" />
       <path d="M6 10v9a1 1 0 0 0 1 1h3v-6h4v6h3a1 1 0 0 0 1-1v-9" />
-    </svg>
-  )
-}
-
-function StudyIcon({ className }: { className?: string }) {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={1.8}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className={className}
-      aria-hidden
-    >
-      <path d="M12 6.5c-1.4-1.2-3.4-1.8-6-1.8v12.6c2.6 0 4.6.6 6 1.8" />
-      <path d="M12 6.5c1.4-1.2 3.4-1.8 6-1.8v12.6c-2.6 0-4.6.6-6 1.8" />
-      <path d="M12 6.5v12.6" />
     </svg>
   )
 }
@@ -97,20 +88,23 @@ function App() {
   // Current sync auth state, surfaced by ProfileView — drives the Profile
   // tab's label ("Log In" vs "Profile").
   const [hkey, setHkey] = useState<string | null>(null)
-  // Size of the queue the last "study" hand-off was for (root aggregate from
-  // Home, or a single deck's total from Decks) — fed to StudyView as
-  // `initialQueueTotal` to drive its real progress bar. `undefined` means "no
-  // real target yet", which StudyView renders as a neutral indeterminate bar.
-  const [studyTotal, setStudyTotal] = useState<number | undefined>(undefined)
+  // Queue the last "study" hand-off was for (a single deck's breakdown, from
+  // either Home's deck cards or the Decks tab) — fed to StudyView as
+  // `initialQueue` to drive its real progress bar and bucket coloring.
+  // `undefined` means "no real target yet", which StudyView renders as a
+  // neutral indeterminate state.
+  const [studyQueue, setStudyQueue] = useState<StudyQueueInfo | undefined>(undefined)
 
-  const goStudy = (total: number) => {
-    setStudyTotal(total)
+  const goStudy = (queue: StudyQueueInfo) => {
+    setStudyQueue(queue)
     setView('study')
   }
 
+  // Study has no permanent nav button — it's reached by tapping a deck card
+  // on Home or Decks, not via the bottom nav — but 'study' stays a valid View
+  // so those hand-offs can still navigate to it.
   const tabs: { id: View; label: string; icon: (className?: string) => ReactNode }[] = [
     { id: 'home', label: 'Home', icon: (c) => <HomeIcon className={c} /> },
-    { id: 'study', label: 'Study', icon: (c) => <StudyIcon className={c} /> },
     { id: 'decks', label: 'Decks', icon: (c) => <DecksIcon className={c} /> },
     {
       id: 'profile',
@@ -142,7 +136,9 @@ function App() {
             transition={{ duration: 0.18 }}
           >
             {view === 'home' && <HomeView onStudyDeck={goStudy} />}
-            {view === 'study' && <StudyView initialQueueTotal={studyTotal} />}
+            {view === 'study' && (
+              <StudyView initialQueue={studyQueue} onBack={() => setView('home')} />
+            )}
             {view === 'decks' && <DecksView onStudyDeck={goStudy} />}
             {view === 'profile' && (
               <ProfileView onBusyChange={setSyncBusy} onAuthChange={setHkey} />
@@ -152,18 +148,21 @@ function App() {
       </main>
 
       <nav
-        className="fixed inset-x-0 bottom-0 z-20 border-t border-neutral-200 bg-white/90 pb-[max(0.5rem,env(safe-area-inset-bottom))] backdrop-blur dark:border-neutral-800 dark:bg-neutral-950/90"
+        className="fixed inset-x-0 bottom-4 z-20 flex justify-center px-4 pb-[env(safe-area-inset-bottom)]"
         aria-label="Primary"
       >
-        <div className="mx-auto flex max-w-3xl items-stretch justify-around px-2 pt-2">
+        <div className="flex gap-1 rounded-full bg-white/95 p-2 shadow-lg backdrop-blur dark:bg-neutral-900/95">
           {tabs.map((tab) => (
             <button
               key={tab.id}
               type="button"
               onClick={() => setView(tab.id)}
               disabled={syncBusy && tab.id !== 'profile'}
-              title={syncBusy && tab.id !== 'profile' ? 'A sync is in progress' : undefined}
-              className={`relative flex flex-1 flex-col items-center gap-1 rounded-2xl px-2 py-1.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+              aria-label={tab.label}
+              title={
+                syncBusy && tab.id !== 'profile' ? 'A sync is in progress' : tab.label
+              }
+              className={`relative flex h-12 w-12 items-center justify-center rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
                 view === tab.id
                   ? 'text-white'
                   : 'text-neutral-500 hover:text-neutral-900 dark:hover:text-white'
@@ -172,12 +171,11 @@ function App() {
               {view === tab.id && (
                 <motion.span
                   layoutId="active-tab"
-                  className="absolute inset-0 rounded-2xl bg-indigo-600 dark:bg-indigo-500"
+                  className="absolute inset-0 rounded-full bg-indigo-600 dark:bg-indigo-500"
                   transition={{ type: 'spring', duration: 0.4, bounce: 0.2 }}
                 />
               )}
               <span className="relative z-10">{tab.icon('h-5 w-5')}</span>
-              <span className="relative z-10">{tab.label}</span>
             </button>
           ))}
         </div>
