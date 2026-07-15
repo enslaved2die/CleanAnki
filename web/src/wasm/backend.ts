@@ -185,6 +185,7 @@ interface EmscriptenModule {
   _wasm_sync_full_upload(hkeyPtr: number, hkeyLen: number, endpointPtr: number, endpointLen: number): number
   _wasm_sync_media(hkeyPtr: number, hkeyLen: number, endpointPtr: number, endpointLen: number): number
   _wasm_sync_poll(): number
+  _wasm_sync_progress_json(): number
 }
 
 type EmscriptenModuleFactory = (
@@ -662,6 +663,44 @@ export class FullSyncRequiredError extends Error {
 const SYNC_POLL_INTERVAL_MS = 100
 
 /**
+ * Live progress for whichever sync is currently running — see
+ * `wasm_sync_progress_json`'s doc comment in rust/wasm-bridge/src/main.rs
+ * for the full shape/semantics of each variant. `normal_sync`/`media_sync`
+ * report running counts with no fixed total (the protocols are incremental
+ * round-trips, not one bulk transfer of a known size); `full_sync` reports
+ * real transferred/total byte counts, since `syncFullDownload`/
+ * `syncFullUpload` move one file of a known size.
+ */
+export type SyncProgress =
+  | {
+      kind: 'normal_sync'
+      stage: 'connecting' | 'syncing' | 'finalizing'
+      localUpdate: number
+      localRemove: number
+      remoteUpdate: number
+      remoteRemove: number
+    }
+  | {
+      kind: 'media_sync'
+      checked: number
+      downloadedFiles: number
+      downloadedDeletions: number
+      uploadedFiles: number
+      uploadedDeletions: number
+    }
+  | { kind: 'full_sync'; transferredBytes: number; totalBytes: number }
+  | { kind: 'other' }
+
+/** Reads the latest sync progress snapshot, or `null` if none has been
+ * reported yet (e.g. polled before the background thread got far enough to
+ * construct its progress handler — not an error, just "nothing new"). */
+function readSyncProgress(mod: EmscriptenModule): SyncProgress | null {
+  const rc = mod._wasm_sync_progress_json()
+  if (rc !== 0) return null
+  return JSON.parse(readLastResult(mod)) as SyncProgress
+}
+
+/**
  * Awaits the in-flight sync started by `wasm_sync_login`/`wasm_sync_collection`
  * — see the doc comment atop those bridge exports (rust/wasm-bridge/src/main.rs)
  * for why this must be a poll rather than the wasm call itself blocking:
@@ -669,12 +708,23 @@ const SYNC_POLL_INTERVAL_MS = 100
  * bridge (Emscripten's `emscripten_fetch` in its synchronous mode), so the
  * `wasm_sync_*` entry points return immediately and JS polls to avoid
  * blocking the browser's main thread.
+ *
+ * `onProgress`, if given, is called with each poll tick's progress snapshot
+ * (skipped if none is available yet) — reuses this same poll loop rather
+ * than running a second interval alongside it.
  */
-async function pollSyncUntilDone(mod: EmscriptenModule): Promise<void> {
+async function pollSyncUntilDone(
+  mod: EmscriptenModule,
+  onProgress?: (progress: SyncProgress) => void,
+): Promise<void> {
   for (;;) {
     const state = mod._wasm_sync_poll()
     if (state === 2) return
     if (state === 1) {
+      if (onProgress) {
+        const progress = readSyncProgress(mod)
+        if (progress) onProgress(progress)
+      }
       await new Promise((resolve) => setTimeout(resolve, SYNC_POLL_INTERVAL_MS))
       continue
     }
@@ -739,7 +789,11 @@ export async function syncLogin(
  * etc). A sync can change local cards/notes/decks just like an import or an
  * answer does, so callers must still call `persistCollection()` afterwards.
  */
-export async function syncCollection(hkey: string, endpoint: string): Promise<void> {
+export async function syncCollection(
+  hkey: string,
+  endpoint: string,
+  onProgress?: (progress: SyncProgress) => void,
+): Promise<void> {
   const mod = await loadModule()
   const encoder = new TextEncoder()
   const hkeyBytes = encoder.encode(hkey)
@@ -753,7 +807,7 @@ export async function syncCollection(hkey: string, endpoint: string): Promise<vo
   if (rc !== 0) {
     throw new Error(`wasm_sync_collection failed to start (${rc}): ${readLastError(mod)}`)
   }
-  await pollSyncUntilDone(mod)
+  await pollSyncUntilDone(mod, onProgress)
 }
 
 /**
@@ -767,7 +821,11 @@ export async function syncCollection(hkey: string, endpoint: string): Promise<vo
  * were showing (decks, current card, stats) since the collection underneath
  * has been swapped out entirely.
  */
-export async function syncFullDownload(hkey: string, endpoint: string): Promise<void> {
+export async function syncFullDownload(
+  hkey: string,
+  endpoint: string,
+  onProgress?: (progress: SyncProgress) => void,
+): Promise<void> {
   const mod = await loadModule()
   const encoder = new TextEncoder()
   const hkeyBytes = encoder.encode(hkey)
@@ -781,7 +839,7 @@ export async function syncFullDownload(hkey: string, endpoint: string): Promise<
   if (rc !== 0) {
     throw new Error(`wasm_sync_full_download failed to start (${rc}): ${readLastError(mod)}`)
   }
-  await pollSyncUntilDone(mod)
+  await pollSyncUntilDone(mod, onProgress)
 }
 
 /**
@@ -790,7 +848,11 @@ export async function syncFullDownload(hkey: string, endpoint: string): Promise<
  * choice, for when the local collection is authoritative. **Destructive to
  * remote data.** Same shape as `syncFullDownload` otherwise.
  */
-export async function syncFullUpload(hkey: string, endpoint: string): Promise<void> {
+export async function syncFullUpload(
+  hkey: string,
+  endpoint: string,
+  onProgress?: (progress: SyncProgress) => void,
+): Promise<void> {
   const mod = await loadModule()
   const encoder = new TextEncoder()
   const hkeyBytes = encoder.encode(hkey)
@@ -804,7 +866,7 @@ export async function syncFullUpload(hkey: string, endpoint: string): Promise<vo
   if (rc !== 0) {
     throw new Error(`wasm_sync_full_upload failed to start (${rc}): ${readLastError(mod)}`)
   }
-  await pollSyncUntilDone(mod)
+  await pollSyncUntilDone(mod, onProgress)
 }
 
 /**
@@ -820,7 +882,11 @@ export async function syncFullUpload(hkey: string, endpoint: string): Promise<vo
  * call `persistMedia()` (`db/collection.ts`) afterwards to copy them to OPFS,
  * exactly as already done after `importApkg`.
  */
-export async function syncMedia(hkey: string, endpoint: string): Promise<void> {
+export async function syncMedia(
+  hkey: string,
+  endpoint: string,
+  onProgress?: (progress: SyncProgress) => void,
+): Promise<void> {
   const mod = await loadModule()
   const encoder = new TextEncoder()
   const hkeyBytes = encoder.encode(hkey)
@@ -834,5 +900,5 @@ export async function syncMedia(hkey: string, endpoint: string): Promise<void> {
   if (rc !== 0) {
     throw new Error(`wasm_sync_media failed to start (${rc}): ${readLastError(mod)}`)
   }
-  await pollSyncUntilDone(mod)
+  await pollSyncUntilDone(mod, onProgress)
 }

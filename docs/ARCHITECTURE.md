@@ -2253,3 +2253,100 @@ test suite (33/33), `tsc --noEmit`, and a fresh build all clean. **Not
 verified**: an actual two-session sync against a real server showing a
 faster second sync — the user is best positioned to confirm "Sync now" feels
 snappier on a second run with nothing new to transfer.
+
+## 28. 2026-07-15 — Live sync progress bar
+
+The user asked whether a progress bar was possible, and whether the sync
+server sends anything usable for it. It doesn't, directly — rslib's client
+code computes its own progress locally as it processes each sync step, in a
+thread-safe shared state real Anki desktop already polls from a separate
+channel to drive its own progress UI. This bridge never exposed any of it;
+`wasm_sync_poll` only ever reported running/done/error.
+
+**Two genuinely different shapes**, depending on sync type:
+- `NormalSyncProgress`/`MediaSyncProgress` (`sync/collection/normal.rs`,
+  `sync/media/progress.rs`) — running counts (`local_update`/`remote_update`/
+  etc., `checked`/`downloaded_files`/etc.) with **no fixed total**: both
+  protocols are incremental round-trips, not one bulk transfer of a known
+  size. So these render as a live counter with an indeterminate bar, not a
+  real percentage.
+- `FullSyncProgress` (`sync/collection/progress.rs`) — `transferred_bytes`/
+  `total_bytes`, a genuine percentage, since `full_download`/`full_upload`
+  move one file of a known size.
+
+**The concurrency problem, and why it needs a *second* shared state, not
+the existing collection lock.** `Collection` already carries this progress
+state (`state.progress: Arc<Mutex<ProgressState>>`, written to by
+`Collection::new_progress_handler`), but reading it the "obvious" way — lock
+`collection_slot()`, peek at `col.state.progress` — doesn't work here: a
+normal collection sync holds that lock for its *entire* duration (documented
+in §18/24's `onBusyChange` writeup), and full_download/full_upload take the
+`Collection` out of the slot entirely while they run. Either way, the main
+thread has no safe access to it without risking the same main-thread
+`Atomics.wait` block `onBusyChange` already exists to avoid. Fix: grab a
+*clone* of the `Arc<Mutex<ProgressState>>` (cheap — just a refcount bump)
+right when each sync export first gets its `Collection` reference, *before*
+the long-running work starts, and stash that clone in its own
+bridge-level `SYNC_PROGRESS_STATE: Mutex<Option<Arc<Mutex<ProgressState>>>>`.
+That's a separate, always-fast lock the main thread can poll freely — it's
+only ever touched briefly, at the start of each sync call.
+
+**Implementation**: `Collection.progress_state()` is a new one-line public
+method (`rslib/src/progress.rs`, right next to `new_progress_handler`,
+mirroring it exactly) — the `progress` module itself had to be widened from
+`mod` to `pub mod` in `lib.rs` too, since `Progress`/`ProgressState` were
+already `pub` but unreachable from outside the crate through a private
+module. Each of the four sync exports in `rust/wasm-bridge/src/main.rs`
+(`wasm_sync_collection`, `_full_download`, `_full_upload`, `_media`) now
+calls `set_sync_progress_state(col.progress_state())` right after obtaining
+`col` — for `full_download`/`full_upload` specifically, *before* the call
+that consumes `col` by value, since `full_download`/`full_upload` construct
+their own progress handler from that same shared state as their first
+internal step (confirmed by reading `full_download_with_server`/
+`full_upload_with_server` — the handler is built, *then* `self.close(...)`
+runs), so the clone stays valid for the whole transfer even once the local
+`col` binding is gone. New export `wasm_sync_progress_json()` reads
+`SYNC_PROGRESS_STATE`, then the inner `ProgressState.last_progress`, and
+serializes whichever `Progress` variant is present to JSON by hand (no new
+`Serialize` derives needed on the vendored types — all fields were already
+`pub`, just read directly): `{"kind":"normal_sync",...}`,
+`{"kind":"media_sync",...}`, `{"kind":"full_sync",...}`, or
+`{"kind":"other"}` for anything else that might be sharing the same
+collection's progress slot (e.g. `wasm_import_apkg`'s own `ImportProgress`,
+never wired up for polling — harmless, just ignored). Returns 1 (not an
+error) when nothing's been reported yet, e.g. polled in the brief window
+before the background thread reaches its progress-handler construction.
+
+**JS side**: `backend.ts` reuses the *existing* `pollSyncUntilDone` loop
+rather than adding a second interval — it now takes an optional
+`onProgress?: (p: SyncProgress) => void` callback, invoked each poll tick
+with `readSyncProgress()`'s result when one's available. `syncCollection`/
+`syncFullDownload`/`syncFullUpload`/`syncMedia` all gained the same optional
+trailing parameter. `SyncSettings` renders a shared `SyncProgressDisplay`:
+a real percentage bar for `full_sync` (`transferredBytes/totalBytes`,
+byte-formatted), and an indeterminate/striped bar + live counter text for
+`normal_sync` (stage + changes-so-far) and `media_sync` (checked/downloaded/
+uploaded/deletions) — all four handlers pass `setSyncProgress` through and
+clear it in their `finally` blocks so nothing stale lingers once a sync
+phase ends.
+
+**Verified**: fresh build clean (only the `progress` visibility patch is
+new vendored-source surface — small, mirrors precedent), full test suite
+(33/33), `tsc --noEmit` clean. Wrote
+`rust/wasm-bridge/smoke-test/sync_progress_test.mjs` confirming
+`wasm_sync_progress_json` returns 1 (not a crash, not stale data) before any
+sync has run. **Attempted but abandoned**: driving an actual
+`wasm_sync_collection` call (even with a bogus hkey, just to observe the
+synchronous initial-progress side effect `NormalSyncer::new` sets before any
+network I/O) from this same Node harness — confirmed empirically that
+`emscripten_fetch`'s XHR-based transport hard-crashes the Node process the
+instant a sync starts polling its network future forward
+(`ReferenceError: XMLHttpRequest is not defined`, a missing-browser-global
+issue, not a CORS one). This is a Node-harness-only gap, not a real bug —
+consistent with every other network-touching feature this session, which
+all needed a real browser to verify end-to-end. Did not attempt that here:
+port 5173 was already occupied by what looked like a separate, possibly
+user-run dev server, and disturbing it risked interfering with the user's
+own session. **Not verified**: the progress bar actually rendering during a
+real sync against a real server — the user is best placed to confirm what
+the live counters/percentage look like in practice.

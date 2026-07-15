@@ -100,6 +100,23 @@ index 1dbc57a..cf32205 100644
              .clone()
      }
  
+diff --git a/rslib/src/lib.rs b/rslib/src/lib.rs
+index 3bef62b..9a91f4f 100644
+--- a/rslib/src/lib.rs
++++ b/rslib/src/lib.rs
+@@ -31,7 +31,11 @@ pub mod notetype;
+ pub mod ops;
+ mod preferences;
+ pub mod prelude;
+-mod progress;
++// Widened from `mod` to `pub mod` for the CleanAnki wasm bridge: it polls
++// `Collection::progress_state()` (a new method on the already-public
++// `Progress`/`ProgressState` types this module defines) from the main
++// thread to drive a live sync progress bar. See docs/ARCHITECTURE.md.
++pub mod progress;
+ pub mod revlog;
+ pub mod scheduler;
+ pub mod search;
 diff --git a/rslib/src/media/mod.rs b/rslib/src/media/mod.rs
 index 8a599fb..d24c92a 100644
 --- a/rslib/src/media/mod.rs
@@ -119,6 +136,32 @@ index 8a599fb..d24c92a 100644
      pub fn remove_files<S>(&self, filenames: &[S]) -> Result<()>
      where
          S: AsRef<str> + std::fmt::Debug,
+diff --git a/rslib/src/progress.rs b/rslib/src/progress.rs
+index 97d9861..4f3ea90 100644
+--- a/rslib/src/progress.rs
++++ b/rslib/src/progress.rs
+@@ -342,6 +342,21 @@ impl Collection {
+         ThrottlingProgressHandler::new(self.state.progress.clone())
+     }
+ 
++    /// Clone of the shared progress state `new_progress_handler` writes
++    /// into. Added for the CleanAnki wasm bridge: a sync runs on a
++    /// background thread (holding the collection lock, or — for
++    /// full_download/full_upload, which take `self` by value — holding the
++    /// `Collection` itself) for its whole duration, so the main thread can't
++    /// go through the usual collection-locking path to see live progress
++    /// without risking a main-thread `Atomics.wait` block. Grabbing this
++    /// clone up front (before the sync starts) and polling *it* directly —
++    /// a separate, always-fast lock — sidesteps that entirely. Mirrors how
++    /// desktop Anki's own UI polls this same shared state via a separate
++    /// channel while sync runs in the background. See docs/ARCHITECTURE.md.
++    pub fn progress_state(&self) -> Arc<Mutex<ProgressState>> {
++        self.state.progress.clone()
++    }
++
+     pub(crate) fn clear_progress(&mut self) {
+         self.state.progress.lock().unwrap().reset();
+     }
 diff --git a/rslib/src/scheduler/mod.rs b/rslib/src/scheduler/mod.rs
 index 93aee3c..92818cc 100644
 --- a/rslib/src/scheduler/mod.rs

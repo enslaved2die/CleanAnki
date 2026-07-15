@@ -79,6 +79,7 @@ fn main() {
         "_wasm_sync_full_upload",
         "_wasm_sync_media",
         "_wasm_sync_poll",
+        "_wasm_sync_progress_json",
     ];
     let list = exported_functions
         .iter()

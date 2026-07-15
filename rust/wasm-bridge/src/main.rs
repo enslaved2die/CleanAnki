@@ -30,6 +30,7 @@
 //!                   milliseconds_taken, custom_data, from_queue }`
 //!   - `Rating { Again, Hard, Good, Easy }`
 
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
@@ -37,6 +38,8 @@ use anki::backend::Backend;
 use anki::collection::Collection;
 use anki::collection::CollectionBuilder;
 use anki::import_export::package::ImportAnkiPackageOptions;
+use anki::progress::Progress;
+use anki::progress::ProgressState;
 use anki::prelude::BoolKey;
 use anki::prelude::CardId;
 use anki::prelude::DeckId;
@@ -48,6 +51,7 @@ use anki::search::SortMode;
 use anki::services::StatsService;
 use anki::sync::collection::normal::NormalSyncer;
 use anki::sync::collection::normal::SyncActionRequired;
+use anki::sync::collection::progress::SyncStage;
 use anki::sync::http_client::HttpSyncClient;
 use anki::sync::login::sync_login;
 use anki::sync::login::SyncAuth;
@@ -1294,6 +1298,99 @@ pub extern "C" fn wasm_sync_poll() -> i32 {
     SYNC_STATE.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Clone of whichever collection's shared progress state the *current*
+/// sync op is writing into (`Collection::progress_state()`), for
+/// `wasm_sync_progress_json` to poll from the main thread. A separate,
+/// always-fast lock from `collection_slot()`'s — a normal collection sync
+/// holds that lock for its whole duration (and full_download/full_upload
+/// take the `Collection` out of the slot entirely), so polling progress
+/// through it would risk the exact main-thread `Atomics.wait` block
+/// `onBusyChange` already works around elsewhere. Set once, right when each
+/// sync export grabs its `Collection` reference, before the actual
+/// network I/O starts.
+static SYNC_PROGRESS_STATE: Mutex<Option<Arc<Mutex<ProgressState>>>> = Mutex::new(None);
+
+fn set_sync_progress_state(state: Arc<Mutex<ProgressState>>) {
+    if let Ok(mut guard) = SYNC_PROGRESS_STATE.lock() {
+        *guard = Some(state);
+    }
+}
+
+/// Reads the latest progress reported by the current (or most recently
+/// finished) sync op, as a JSON string in `wasm_last_result_*`. Returns 0 if
+/// progress data is available, 1 if none has been reported yet (not an
+/// error — e.g. called before the background thread has gotten far enough
+/// to construct its progress handler), negative on an internal error.
+///
+/// Shape depends on the `"kind"` field:
+/// - `"normal_sync"`: `stage` ("connecting"/"syncing"/"finalizing"),
+///   `localUpdate`/`localRemove`/`remoteUpdate`/`remoteRemove` (counts so
+///   far — collection sync has no fixed total, so this is a live counter,
+///   not a percentage).
+/// - `"media_sync"`: `checked`/`downloadedFiles`/`downloadedDeletions`/
+///   `uploadedFiles`/`uploadedDeletions` (counts so far — also no fixed
+///   total).
+/// - `"full_sync"`: `transferredBytes`/`totalBytes` — full_download/upload
+///   transfer one big file of a known size, so this *is* a real percentage
+///   (`transferredBytes / totalBytes`).
+/// - `"other"`: some other rslib operation (e.g. `wasm_import_apkg`) last
+///   touched this collection's shared progress state; nothing sync-related
+///   to show.
+#[no_mangle]
+pub extern "C" fn wasm_sync_progress_json() -> i32 {
+    let state = match SYNC_PROGRESS_STATE.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => {
+            set_last_error("internal lock poisoned");
+            return -1;
+        }
+    };
+    let Some(state) = state else {
+        return 1;
+    };
+    let progress = match state.lock() {
+        Ok(guard) => guard.last_progress,
+        Err(_) => {
+            set_last_error("internal lock poisoned");
+            return -1;
+        }
+    };
+    let Some(progress) = progress else {
+        return 1;
+    };
+
+    let json = match progress {
+        Progress::NormalSync(p) => serde_json::json!({
+            "kind": "normal_sync",
+            "stage": match p.stage {
+                SyncStage::Connecting => "connecting",
+                SyncStage::Syncing => "syncing",
+                SyncStage::Finalizing => "finalizing",
+            },
+            "localUpdate": p.local_update,
+            "localRemove": p.local_remove,
+            "remoteUpdate": p.remote_update,
+            "remoteRemove": p.remote_remove,
+        }),
+        Progress::MediaSync(p) => serde_json::json!({
+            "kind": "media_sync",
+            "checked": p.checked,
+            "downloadedFiles": p.downloaded_files,
+            "downloadedDeletions": p.downloaded_deletions,
+            "uploadedFiles": p.uploaded_files,
+            "uploadedDeletions": p.uploaded_deletions,
+        }),
+        Progress::FullSync(p) => serde_json::json!({
+            "kind": "full_sync",
+            "transferredBytes": p.transferred_bytes,
+            "totalBytes": p.total_bytes,
+        }),
+        _ => serde_json::json!({ "kind": "other" }),
+    };
+    set_last_result(json.to_string().into_bytes());
+    0
+}
+
 /// Begin a sync **login**: exchanges username/password for a sync key (hkey)
 /// against `endpoint` (empty → official AnkiWeb). Returns 0 once the background
 /// login has been started (negative only on a bad argument); JS then polls
@@ -1437,6 +1534,7 @@ pub unsafe extern "C" fn wasm_sync_collection(
             }
         };
 
+        set_sync_progress_state(col.progress_state());
         let server = HttpSyncClient::new(auth, build_sync_http_client());
         let result = block_on(NormalSyncer::new(col, server).sync());
         match result {
@@ -1556,6 +1654,12 @@ pub unsafe extern "C" fn wasm_sync_full_download(
             endpoint: endpoint_opt,
             io_timeout_secs: None,
         };
+        // Grab this before `full_download` consumes `col` — `full_download`
+        // builds its own progress handler from the same shared state as its
+        // very first step (see `Collection::full_download_with_server`), so
+        // this clone stays valid/live for the whole transfer even once `col`
+        // itself is gone.
+        set_sync_progress_state(col.progress_state());
         let result = block_on(col.full_download(auth, build_sync_http_client()));
         if let Err(e) = reopen_collection() {
             set_last_error(format!(
@@ -1629,6 +1733,10 @@ pub unsafe extern "C" fn wasm_sync_full_upload(
             endpoint: endpoint_opt,
             io_timeout_secs: None,
         };
+        // See the matching comment in `wasm_sync_full_download`: `full_upload`
+        // builds its progress handler from the same shared state before
+        // consuming `self`, so this clone stays live for the whole transfer.
+        set_sync_progress_state(col.progress_state());
         let result = block_on(col.full_upload(auth, build_sync_http_client()));
         if let Err(e) = reopen_collection() {
             set_last_error(format!(
@@ -1732,6 +1840,7 @@ pub unsafe extern "C" fn wasm_sync_media(
                     return;
                 }
             };
+            set_sync_progress_state(col.progress_state());
             (mgr, col.new_progress_handler::<MediaSyncProgress>())
         };
 

@@ -7,6 +7,7 @@ import {
   syncFullUpload,
   syncMedia,
   FullSyncRequiredError,
+  type SyncProgress,
 } from '../../wasm/backend'
 import {
   persistCollection,
@@ -32,6 +33,87 @@ const ENDPOINT_STORAGE_KEY = 'cleananki.sync.endpoint'
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KB', 'MB', 'GB']
+  let value = bytes / 1024
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit++
+  }
+  return `${value.toFixed(1)} ${units[unit]}`
+}
+
+/**
+ * Renders whatever `wasm_sync_progress_json` last reported (see its doc
+ * comment in rust/wasm-bridge/src/main.rs). `full_sync` has a real known
+ * total (one file of a known size), so it gets a real percentage bar;
+ * `normal_sync`/`media_sync` are incremental round-trips with no fixed
+ * total, so they get a live counter with an indeterminate (striped) bar
+ * instead — still much more informative than a bare "Syncing…" spinner.
+ */
+function SyncProgressDisplay({ progress }: { progress: SyncProgress | null }) {
+  if (!progress || progress.kind === 'other') return null
+
+  if (progress.kind === 'full_sync') {
+    const pct =
+      progress.totalBytes > 0
+        ? Math.min(100, Math.round((progress.transferredBytes / progress.totalBytes) * 100))
+        : 0
+    return (
+      <div className="space-y-1">
+        <div className="h-2 w-full overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-700">
+          <div
+            className="h-full rounded-full bg-neutral-900 transition-[width] dark:bg-neutral-100"
+            style={{ width: `${pct}%` }}
+          />
+        </div>
+        <p className="text-xs text-neutral-500 dark:text-neutral-400">
+          {formatBytes(progress.transferredBytes)} / {formatBytes(progress.totalBytes)} ({pct}%)
+        </p>
+      </div>
+    )
+  }
+
+  if (progress.kind === 'normal_sync') {
+    const stageLabel =
+      progress.stage === 'connecting'
+        ? 'Connecting…'
+        : progress.stage === 'finalizing'
+          ? 'Finalizing…'
+          : 'Syncing…'
+    const changes =
+      progress.localUpdate + progress.localRemove + progress.remoteUpdate + progress.remoteRemove
+    return (
+      <div className="space-y-1">
+        <div className="h-1.5 w-full overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-700">
+          <div className="h-full w-1/3 animate-pulse rounded-full bg-neutral-900 dark:bg-neutral-100" />
+        </div>
+        <p className="text-xs text-neutral-500 dark:text-neutral-400">
+          {stageLabel} {changes > 0 && `${changes} change${changes === 1 ? '' : 's'} so far`}
+        </p>
+      </div>
+    )
+  }
+
+  // media_sync
+  return (
+    <div className="space-y-1">
+      <div className="h-1.5 w-full overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-700">
+        <div className="h-full w-1/3 animate-pulse rounded-full bg-neutral-900 dark:bg-neutral-100" />
+      </div>
+      <p className="text-xs text-neutral-500 dark:text-neutral-400">
+        {progress.checked} checked
+        {progress.downloadedFiles > 0 && `, ${progress.downloadedFiles} downloaded`}
+        {progress.uploadedFiles > 0 && `, ${progress.uploadedFiles} uploaded`}
+        {(progress.downloadedDeletions > 0 || progress.uploadedDeletions > 0) &&
+          `, ${progress.downloadedDeletions + progress.uploadedDeletions} deletion(s)`}
+      </p>
+    </div>
+  )
 }
 
 /**
@@ -80,6 +162,14 @@ export default function SyncSettings({
   // either way.
   const [mediaSyncStatus, setMediaSyncStatus] = useState<'idle' | 'busy' | 'done' | 'error'>('idle')
   const [mediaSyncError, setMediaSyncError] = useState<string | null>(null)
+
+  // Live progress for whichever sync phase is currently running (collection,
+  // full download/upload, or media) — see `wasm_sync_progress_json`'s doc
+  // comment in rust/wasm-bridge/src/main.rs. Shared across phases: each
+  // handler passes `setSyncProgress` as the `onProgress` callback, so it
+  // naturally shows the collection sync's progress, then the media sync's,
+  // without needing separate state per phase.
+  const [syncProgress, setSyncProgress] = useState<SyncProgress | null>(null)
 
   // Empty endpoint means official AnkiWeb (see `parse_endpoint` in
   // rust/wasm-bridge/src/main.rs) — only persist/use a real URL when the
@@ -135,13 +225,15 @@ export default function SyncSettings({
     setMediaSyncError(null)
     try {
       await restoreMediaToBackend()
-      await syncMedia(currentHkey, effectiveEndpoint)
+      await syncMedia(currentHkey, effectiveEndpoint, setSyncProgress)
       await persistMedia()
       await persistMediaDb()
       setMediaSyncStatus('done')
     } catch (err) {
       setMediaSyncError(errorMessage(err))
       setMediaSyncStatus('error')
+    } finally {
+      setSyncProgress(null)
     }
   }
 
@@ -152,7 +244,7 @@ export default function SyncSettings({
     setNeedsFullSync(false)
     onBusyChange?.(true)
     try {
-      await syncCollection(hkey, effectiveEndpoint)
+      await syncCollection(hkey, effectiveEndpoint, setSyncProgress)
       await persistCollection()
       setSyncStatus('done')
       await syncMediaAfterCollectionSync(hkey)
@@ -166,6 +258,7 @@ export default function SyncSettings({
       }
     } finally {
       onBusyChange?.(false)
+      setSyncProgress(null)
     }
   }
 
@@ -184,7 +277,7 @@ export default function SyncSettings({
     setFullSyncError(null)
     onBusyChange?.(true)
     try {
-      await syncFullDownload(hkey, effectiveEndpoint)
+      await syncFullDownload(hkey, effectiveEndpoint, setSyncProgress)
       await persistCollection()
       setNeedsFullSync(false)
       setFullSyncStatus('done')
@@ -194,6 +287,7 @@ export default function SyncSettings({
       setFullSyncStatus('error')
     } finally {
       onBusyChange?.(false)
+      setSyncProgress(null)
     }
   }
 
@@ -211,7 +305,7 @@ export default function SyncSettings({
     setFullSyncError(null)
     onBusyChange?.(true)
     try {
-      await syncFullUpload(hkey, effectiveEndpoint)
+      await syncFullUpload(hkey, effectiveEndpoint, setSyncProgress)
       await persistCollection()
       setNeedsFullSync(false)
       setFullSyncStatus('done')
@@ -221,6 +315,7 @@ export default function SyncSettings({
       setFullSyncStatus('error')
     } finally {
       onBusyChange?.(false)
+      setSyncProgress(null)
     }
   }
 
@@ -359,6 +454,10 @@ export default function SyncSettings({
                 : 'Sync now'}
           </button>
 
+          {(syncStatus === 'busy' || mediaSyncStatus === 'busy') && (
+            <SyncProgressDisplay progress={syncProgress} />
+          )}
+
           {needsFullSync && (
             <div className="space-y-3 rounded-lg border border-amber-300 bg-amber-50 p-4 dark:border-amber-800 dark:bg-amber-950/50">
               <p className="text-sm text-amber-800 dark:text-amber-200">
@@ -397,6 +496,9 @@ export default function SyncSettings({
                   {fullSyncStatus === 'busy' ? 'Working…' : 'Upload to server'}
                 </button>
               </div>
+              {(fullSyncStatus === 'busy' || mediaSyncStatus === 'busy') && (
+                <SyncProgressDisplay progress={syncProgress} />
+              )}
               <p className="text-xs text-amber-700 dark:text-amber-300">
                 "Download" replaces what's in this browser with the server's copy. "Upload"
                 replaces what's on the server with this browser's copy. Either is destructive to
