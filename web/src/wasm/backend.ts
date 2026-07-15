@@ -176,6 +176,7 @@ interface EmscriptenModule {
   _wasm_checkpoint_media_db(): number
   _wasm_import_apkg(ptr: number, len: number): number
   _wasm_list_decks(): number
+  _wasm_create_deck(ptr: number, len: number): number
   _wasm_get_deck_tree(): number
   _wasm_get_stats(): number
   _wasm_reset_progress(): number
@@ -486,6 +487,29 @@ export async function listDecks(): Promise<Deck[]> {
   }
   const pairs = JSON.parse(readLastResult(mod)) as [string, string][]
   return pairs.map(([id, name]) => ({ id: BigInt(id), name }))
+}
+
+/**
+ * Creates a new, empty deck (or reuses an existing one with the same name) —
+ * the real Anki desktop "Create Deck" dialog's own backing call. `name`
+ * accepts `::`-separated nesting (e.g. `"Spanish::Verbs"` creates/reuses
+ * `Spanish` as a parent and creates `Verbs` under it); passing an existing
+ * deck's name just returns that deck's id rather than erroring, same as real
+ * Anki. Returns the new (or reused) deck's id as a `bigint` — see `Deck.id`'s
+ * doc comment for why deck ids are encoded as JSON strings and parsed back
+ * here rather than left as JSON numbers.
+ *
+ * Callers should call `persistCollection()` afterwards, same as every other
+ * mutating call in this app.
+ */
+export async function createDeck(name: string): Promise<bigint> {
+  const mod = await loadModule()
+  const nameBytes = new TextEncoder().encode(name)
+  const rc = withWasmBuffer(mod, nameBytes, (ptr, len) => mod._wasm_create_deck(ptr, len))
+  if (rc !== 0) {
+    throw new Error(`wasm_create_deck failed (${rc}): ${readLastError(mod)}`)
+  }
+  return BigInt(JSON.parse(readLastResult(mod)) as string)
 }
 
 /** Raw JSON shape `wasm_get_deck_tree` writes (`deckId` as a string, same

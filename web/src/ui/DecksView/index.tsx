@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
-import { getDeckTree, setCurrentDeck, deleteDeck, type DeckTreeNode } from '../../wasm/backend'
+import {
+  getDeckTree,
+  setCurrentDeck,
+  deleteDeck,
+  createDeck,
+  type DeckTreeNode,
+} from '../../wasm/backend'
 import { ensureCollectionReady, persistCollection } from '../../db/collection'
 import ImportView from '../ImportView'
 
@@ -104,8 +110,9 @@ function DeckRow({
  *
  * The "+" button opens a small menu for adding content: importing a .apkg
  * (delegates entirely to the existing `ImportView`, just mounted inside a
- * modal here) or creating a new deck from scratch (deliberately left
- * disabled — not implemented yet, per explicit product direction).
+ * modal here) or creating a new, empty deck by name (a thin inline form
+ * calling `createDeck`, matching real Anki desktop's own "Create Deck"
+ * dialog — just a name, no notes/cards).
  */
 export default function DecksView({
   onStudyDeck,
@@ -119,6 +126,9 @@ export default function DecksView({
 
   const [menuOpen, setMenuOpen] = useState(false)
   const [importOpen, setImportOpen] = useState(false)
+  const [createOpen, setCreateOpen] = useState(false)
+  const [newDeckName, setNewDeckName] = useState('')
+  const [creating, setCreating] = useState(false)
 
   const refresh = useCallback(async () => {
     const t = await getDeckTree()
@@ -188,6 +198,32 @@ export default function DecksView({
     })
   }, [refresh])
 
+  const closeCreate = useCallback(() => {
+    setCreateOpen(false)
+    setNewDeckName('')
+  }, [])
+
+  const handleCreateDeck = useCallback(
+    async () => {
+      const name = newDeckName.trim()
+      if (!name) return
+
+      setCreating(true)
+      try {
+        await createDeck(name)
+        await persistCollection()
+        await refresh()
+        closeCreate()
+      } catch (err) {
+        setErrorMsg(errorMessage(err))
+        setStatus('error')
+      } finally {
+        setCreating(false)
+      }
+    },
+    [newDeckName, refresh, closeCreate],
+  )
+
   return (
     <motion.div
       initial={{ opacity: 0, y: 8 }}
@@ -237,14 +273,13 @@ export default function DecksView({
                   <div className="border-t border-neutral-100 dark:border-neutral-800" />
                   <button
                     type="button"
-                    disabled
-                    title="Coming soon"
-                    className="flex w-full items-center justify-between px-4 py-3 text-left text-sm font-medium text-neutral-400 disabled:cursor-not-allowed dark:text-neutral-600"
+                    onClick={() => {
+                      setMenuOpen(false)
+                      setCreateOpen(true)
+                    }}
+                    className="block w-full px-4 py-3 text-left text-sm font-medium hover:bg-neutral-50 dark:hover:bg-neutral-800"
                   >
                     Create new deck
-                    <span className="ml-2 rounded-full bg-neutral-100 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-neutral-400 dark:bg-neutral-800 dark:text-neutral-500">
-                      Soon
-                    </span>
                   </button>
                 </motion.div>
               </>
@@ -326,6 +361,82 @@ export default function DecksView({
                 </button>
               </div>
               <ImportView />
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {createOpen && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.15 }}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+            onClick={() => closeCreate()}
+          >
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 12 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 12 }}
+              transition={{ type: 'spring', duration: 0.35, bounce: 0.2 }}
+              onClick={(e) => e.stopPropagation()}
+              className="w-full max-w-md rounded-2xl border border-neutral-200 bg-white p-6 shadow-xl dark:border-neutral-700 dark:bg-neutral-900"
+            >
+              <div className="mb-4 flex items-center justify-between">
+                <h3 className="text-base font-semibold">Create new deck</h3>
+                <button
+                  type="button"
+                  onClick={() => closeCreate()}
+                  aria-label="Close"
+                  className="rounded-full p-1 text-neutral-400 hover:bg-neutral-100 hover:text-neutral-700 dark:hover:bg-neutral-800 dark:hover:text-neutral-200"
+                >
+                  ✕
+                </button>
+              </div>
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault()
+                  handleCreateDeck()
+                }}
+                className="space-y-4"
+              >
+                <div>
+                  <label className="block text-sm font-medium text-neutral-700 dark:text-neutral-300">
+                    Deck name
+                  </label>
+                  <input
+                    type="text"
+                    autoFocus
+                    value={newDeckName}
+                    onChange={(e) => setNewDeckName(e.target.value)}
+                    placeholder="e.g. Spanish::Verbs"
+                    disabled={creating}
+                    className="mt-2 w-full rounded-lg border border-neutral-300 bg-white px-4 py-2.5 text-neutral-900 placeholder-neutral-400 transition-colors focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200 dark:border-neutral-600 dark:bg-neutral-900 dark:text-neutral-100 dark:placeholder-neutral-500 dark:focus:ring-indigo-900"
+                  />
+                  <p className="mt-1.5 text-xs text-neutral-500 dark:text-neutral-400">
+                    Use "::" to nest under a parent deck, e.g. "Spanish::Verbs".
+                  </p>
+                </div>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => closeCreate()}
+                    disabled={creating}
+                    className="flex-1 rounded-lg border border-neutral-300 px-4 py-2.5 text-sm font-medium text-neutral-700 transition-colors hover:bg-neutral-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-neutral-600 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={creating || newDeckName.trim().length === 0}
+                    className="flex-1 rounded-lg bg-indigo-600 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-indigo-500 dark:hover:bg-indigo-400"
+                  >
+                    {creating ? 'Creating…' : 'Create'}
+                  </button>
+                </div>
+              </form>
             </motion.div>
           </motion.div>
         )}

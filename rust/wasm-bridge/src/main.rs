@@ -690,6 +690,82 @@ pub extern "C" fn wasm_get_deck_tree() -> i32 {
     }
 }
 
+/// Creates a new, empty deck (or reuses an existing one with the same name)
+/// — the real Anki desktop "Create Deck" dialog's own backing call,
+/// `Collection::get_or_create_normal_deck`. `human_name` accepts `::`-separated
+/// nesting (e.g. `"Spanish::Verbs"` creates/reuses `Spanish` as a parent and
+/// creates `Verbs` under it), and has get-or-create semantics: passing an
+/// existing deck's name just returns that deck rather than erroring, same as
+/// real Anki.
+///
+/// A blank/whitespace-only name is rejected here rather than handed to
+/// rslib: `NativeDeckName::from_human_name` silently turns each empty
+/// `::`-separated component into the literal string `"blank"` rather than
+/// erroring (see `rslib/src/decks/name.rs`), which would create a
+/// confusingly-named deck instead of surfacing a clear error to the user.
+///
+/// On success, writes the new (or reused) deck's id to `wasm_last_result_*`
+/// as a JSON **string** (not a bare number) — deck ids are i64
+/// creation-timestamps that can exceed `Number.MAX_SAFE_INTEGER`, so this
+/// bridge always encodes them as strings for the caller to parse back into a
+/// `BigInt` (same convention as `wasm_list_decks`/`wasm_get_deck_tree`).
+///
+/// Returns 0 on success, negative on error (see `wasm_last_error_*`).
+///
+/// # Safety
+/// `ptr`/`len` must describe a valid, readable UTF-8 byte slice (or
+/// `len == 0`).
+#[no_mangle]
+pub unsafe extern "C" fn wasm_create_deck(ptr: *const u8, len: usize) -> i32 {
+    let name = match str_from_raw(ptr, len) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(e);
+            return -1;
+        }
+    };
+
+    if name.trim().is_empty() {
+        set_last_error("deck name cannot be empty");
+        return -1;
+    }
+
+    let mut guard = match collection_slot().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            set_last_error("internal lock poisoned");
+            return -2;
+        }
+    };
+    let col = match guard.as_mut() {
+        Some(c) => c,
+        None => {
+            set_last_error("no collection open; call wasm_open_collection first");
+            return -1;
+        }
+    };
+
+    match col.get_or_create_normal_deck(&name) {
+        Ok(deck) => {
+            let json = serde_json::Value::String(deck.id.0.to_string());
+            match serde_json::to_vec(&json) {
+                Ok(bytes) => {
+                    set_last_result(bytes);
+                    0
+                }
+                Err(e) => {
+                    set_last_error(e);
+                    -4
+                }
+            }
+        }
+        Err(e) => {
+            set_last_error(e);
+            -3
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Statistics
 // ---------------------------------------------------------------------------
