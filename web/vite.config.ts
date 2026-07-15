@@ -31,6 +31,7 @@ export default defineConfig({
       // large wasm binaries) once that artifact exists.
       workbox: {
         globPatterns: ['**/*.{js,css,html,svg,png,ico,wasm}'],
+        maximumFileSizeToCacheInBytes: 15 * 1024 * 1024,
       },
       manifest: {
         name: 'CleanAnki',
@@ -39,7 +40,28 @@ export default defineConfig({
         theme_color: '#16171d',
         background_color: '#16171d',
         display: 'standalone',
-        icons: [],
+        // Generated via IconKitchen — public/favicon.ico + apple-touch-icon.png
+        // cover the plain <link> tags in index.html; these cover the install/
+        // home-screen icon Android/desktop installers read from the manifest.
+        // "maskable" variants have safe-area padding baked in so OS icon
+        // masks (circle, squircle, ...) don't clip the artwork.
+        icons: [
+          { src: '/favicon.ico', sizes: '16x16 32x32', type: 'image/x-icon' },
+          { src: '/icon-192.png', sizes: '192x192', type: 'image/png' },
+          { src: '/icon-512.png', sizes: '512x512', type: 'image/png' },
+          {
+            src: '/icon-192-maskable.png',
+            sizes: '192x192',
+            type: 'image/png',
+            purpose: 'maskable',
+          },
+          {
+            src: '/icon-512-maskable.png',
+            sizes: '512x512',
+            type: 'image/png',
+            purpose: 'maskable',
+          },
+        ],
       },
     }),
   ],
