@@ -115,18 +115,7 @@ function App() {
 
   return (
     <div className="min-h-svh bg-neutral-50 text-neutral-900 dark:bg-neutral-950 dark:text-neutral-100">
-      <header className="flex items-center justify-center border-b border-neutral-200 px-6 py-4 dark:border-neutral-800">
-        <motion.h1
-          className="text-lg font-semibold tracking-tight"
-          initial={{ opacity: 0, y: -8 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.3 }}
-        >
-          CleanAnki
-        </motion.h1>
-      </header>
-
-      <main className="mx-auto max-w-3xl px-6 pb-28 pt-10">
+      <main className="mx-auto max-w-3xl px-6 pb-28 pt-6">
         <AnimatePresence mode="wait">
           <motion.div
             key={view}

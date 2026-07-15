@@ -487,10 +487,10 @@ export default function ProfileView({
     <motion.div
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
-      className="max-w-2xl space-y-6"
+      className="mx-auto max-w-2xl space-y-6"
     >
       {!hkey && (
-        <div className="max-w-md space-y-6">
+        <div className="mx-auto max-w-md space-y-6">
           <div>
             <label className="block text-sm font-medium text-neutral-700 dark:text-neutral-300">
               Username
@@ -580,8 +580,7 @@ export default function ProfileView({
       )}
 
       {hkey && (
-        <>
-          <section className="max-w-md space-y-6">
+        <section className="mx-auto max-w-md space-y-6">
             <div className="rounded-2xl border border-neutral-200 p-4 shadow-sm dark:border-neutral-800">
               <p className="text-sm text-neutral-600 dark:text-neutral-400">
                 Signed in as{' '}
@@ -688,8 +687,12 @@ export default function ProfileView({
               Log out
             </button>
           </section>
+      )}
 
-          <section className="space-y-6 border-t border-neutral-200 pt-6 dark:border-neutral-800">
+      {/* Stats are real local collection data (rslib's own computation, same
+          as real Anki desktop's stats screen) — nothing to do with sync/login
+          state, so this shows regardless of whether you're signed in. */}
+      <section className="mx-auto max-w-2xl space-y-6 border-t border-neutral-200 pt-6 dark:border-neutral-800">
             <h2 className="text-lg font-semibold">Statistics</h2>
 
             {statsStatus === 'loading' && (
@@ -860,8 +863,6 @@ export default function ProfileView({
               </>
             )}
           </section>
-        </>
-      )}
     </motion.div>
   )
 }

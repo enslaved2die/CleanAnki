@@ -287,7 +287,9 @@ export default function StudyView({
         <button
           type="button"
           onClick={onBack}
-          className="-ml-1 inline-flex items-center gap-1.5 rounded-full px-2 py-1.5 text-sm font-medium text-neutral-600 transition-colors hover:bg-neutral-100 hover:text-neutral-900 dark:text-neutral-300 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
+          aria-label="Back to Home"
+          title="Back to Home"
+          className="-ml-1.5 inline-flex h-10 w-10 items-center justify-center rounded-full text-neutral-600 transition-colors hover:bg-neutral-100 hover:text-neutral-900 dark:text-neutral-300 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
         >
           <svg
             viewBox="0 0 24 24"
@@ -301,7 +303,6 @@ export default function StudyView({
           >
             <path d="m15 18-6-6 6-6" />
           </svg>
-          Home
         </button>
       </div>
       {/* Progress bar pinned to the top of the study view. */}
