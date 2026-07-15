@@ -1963,3 +1963,42 @@ which server the user is targeting.
 `tools/cors-proxy/README.md` updated to lead with "AnkiWeb included, not
 just self-hosted," and documents the `SYNC_SERVER=https://sync.ankiweb.net`
 invocation directly.
+
+## 23. 2026-07-12 — A real, working self-hosted proxy, and the actual bug in it
+
+The user set up a real nginx reverse proxy (via Nginx Proxy Manager) in
+front of their self-hosted server — a proper domain
+(`ankisync.local.sellke.casa`) with a real SSL cert, forwarding to
+`192.168.178.4:8081`, and added `Access-Control-Allow-*` headers via the
+per-location "Advanced" config. Confirmed working from real Anki desktop.
+Still failed from CleanAnki with the same CORS error.
+
+**Root cause: their `Access-Control-Allow-Headers` was a fixed list —
+`Authorization, Content-Type, Idempotency-Key, X-Anki-Version` — missing the
+one header the sync protocol actually sends.** Confirmed directly in the
+vendored source: `rust/vendor/anki/rslib/src/sync/request/header_and_stream.rs:129`
+— `pub static SYNC_HEADER_NAME: HeaderName = HeaderName::from_static("anki-sync");`
+— and `http_client/mod.rs:75`, the only place a header is attached to the
+request. A real sync request only ever carries two headers:
+`Content-Type: application/octet-stream` and `anki-sync` (a JSON blob of
+`sync_version`/`sync_key`/`client_ver`/`session_key`). None of
+`Authorization`/`Idempotency-Key`/`X-Anki-Version` are used by this
+protocol at all — harmless to also allow, but irrelevant; the missing
+`anki-sync` is what made the browser's preflight check fail the actual
+request even though the proxy's `Access-Control-Allow-Origin` was present
+and correct.
+
+This is exactly the failure mode a fixed allow-list is prone to, which is
+why both example configs in `tools/cors-proxy/` reflect the browser's own
+`Access-Control-Request-Headers` back (`$http_access_control_request_headers`
+in nginx, `req.headers['access-control-request-headers']` in `proxy.mjs`)
+rather than hardcoding a list — confirmed via this exact real-world case,
+not just a theoretical concern. Gave the user a drop-in replacement using
+that pattern, and documented the specific gotcha in both
+`tools/cors-proxy/README.md` (a new "already have a CORS config and it's
+still failing?" section) and the nginx example's own comments, so it isn't
+re-discovered from scratch by the next self-hosted-server user who copies a
+CORS template from somewhere else.
+
+**Still unverified**: whether the corrected config actually resolves it end
+to end — the user has the fix but hasn't retried yet as of this writing.

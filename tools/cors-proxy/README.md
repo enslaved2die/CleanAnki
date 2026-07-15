@@ -69,3 +69,19 @@ is about response headers, not encryption).
 Edit `upstream_sync_server` in that file to point at your real server, load
 it into nginx, then point CleanAnki's "custom sync server" field at the
 nginx instance's own address instead of your real server's.
+
+## Already have a CORS config and it's still failing?
+
+Hit in practice with an existing, otherwise-correct-looking nginx CORS
+config (via Nginx Proxy Manager): if `Access-Control-Allow-Headers` is a
+*fixed list*, make sure it includes `anki-sync` — that's the one custom
+header the sync protocol actually sends (confirmed in the vendored rslib
+source, `SYNC_HEADER_NAME`), not `Authorization`/`X-Anki-Version`/etc.,
+which are harmless to also allow but don't help. A fixed list that omits it
+looks like it should work (right domain, right port, `Access-Control-Allow-Origin`
+present) but the browser will still reject the actual request, since the
+preflight tells it `anki-sync` isn't an allowed header. Both example configs
+in this directory sidestep this entirely by reflecting whatever the
+browser's own preflight asks for (`$http_access_control_request_headers` in
+nginx, `req.headers['access-control-request-headers']` in `proxy.mjs`)
+instead of hardcoding a list.
