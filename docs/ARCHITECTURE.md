@@ -2118,3 +2118,38 @@ clean, Sync tab renders correctly. **Not verified**: an actual media sync
 against the user's real server — same sandbox reachability limitation as
 §20-24. The user should re-run "Sync now" (or re-do the full download) and
 check whether images now appear.
+
+## 26. 2026-07-15 — Client device label: "emscripten" → "wasm"
+
+The user's sync server showed this client's device entry as
+"emscripten · Anki 26.05", next to their desktop's "macos · Anki 26.05" —
+accurate about the build target, but gives an end user no indication this
+is a browser/wasm client at all. Asked to fix the label, keeping the
+version string.
+
+Two separate client-version strings exist in rslib
+(`rust/vendor/anki/rslib/src/version.rs`), and only one was overridable:
+- `sync_client_version()` (long form, `"anki,{version} ({buildhash}),{platform}"`)
+  already read a `PLATFORM` env var override, falling back to
+  `env::consts::OS`.
+- `sync_client_version_short()` (short form,
+  `"{version},{buildhash},{platform}"`) — confirmed via
+  `rust/vendor/anki/rslib/src/sync/request/mod.rs:172` to be the one
+  actually used to build every `SyncRequest`'s `client_version` field (i.e.
+  the one a server's device list actually renders) — had `platform`
+  hardcoded straight to `env::consts::OS`, no override point.
+
+First attempt only set the env var (`wasm_init_backend` in
+rust/wasm-bridge/src/main.rs, before anything else runs — both functions
+cache their result in a `LazyLock` on first use, so this has to happen
+before the first sync-related call) and re-verified against the real
+AnkiWeb server through the CORS proxy with a throwaway debug build of the
+proxy that logged the raw `anki-sync` request header — caught the header
+still reading `"26.05,,emscripten"` this way, which is what surfaced that
+the *short* form (the one actually used) wasn't wired to the override at
+all. Patched `sync_client_version_short()` to check the same `PLATFORM` env
+var, mirroring the long form exactly (small, precedented vendored-source
+change; patch file regenerated). Re-verified the same way: header now reads
+`"26.05,,wasm"` — will display as "wasm · Anki 26.05" in the device list.
+
+Full test suite (33/33), `tsc --noEmit`, and a fresh build all clean.

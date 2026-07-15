@@ -362,3 +362,26 @@ index 447c6f3..255ce91 100644
  pub mod http_server;
  pub mod login;
  pub mod media;
+diff --git a/rslib/src/version.rs b/rslib/src/version.rs
+index 29f8403..22b57e9 100644
+--- a/rslib/src/version.rs
++++ b/rslib/src/version.rs
+@@ -30,7 +30,17 @@ pub(crate) fn sync_client_version_short() -> &'static str {
+             "{version},{buildhash},{platform}",
+             version = version(),
+             buildhash = buildhash(),
+-            platform = env::consts::OS
++            // CleanAnki (wasm bridge): this is the client-version string a
++            // sync server's device list actually displays (used in every
++            // `SyncRequest`, not just the meta/media requests
++            // `sync_client_version` above covers) — mirrored to respect the
++            // same `PLATFORM` env var override for the same reason: on
++            // wasm32-unknown-emscripten, `env::consts::OS` is literally
++            // "emscripten", which is accurate about the build target but
++            // unhelpful as a device label for an end user (a self-hosted
++            // server showed it next to their desktop's "macos" entry with no
++            // indication either is a browser/wasm client).
++            platform = env::var("PLATFORM").unwrap_or_else(|_| env::consts::OS.to_string())
+         )
+     });
+     &VER

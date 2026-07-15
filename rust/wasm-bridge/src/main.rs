@@ -206,6 +206,31 @@ pub extern "C" fn wasm_last_result_len() -> usize {
 /// `I18n` directly with an English locale.
 #[no_mangle]
 pub extern "C" fn wasm_init_backend() -> i32 {
+    // rslib's sync client-version string (sent as part of every sync request,
+    // and what a sync server's device list displays) is
+    // `"anki,{version} ({buildhash}),{platform}"` — `{platform}` defaults to
+    // `env::consts::OS` unless a `PLATFORM` env var overrides it
+    // (rust/vendor/anki/rslib/src/version.rs `sync_client_version`,
+    // `pub(crate)` — not callable directly, but reachable this way). On our
+    // target that constant is literally "emscripten", which a real sync
+    // server then shows as the device name — accurate about the build
+    // target, but not a helpful label for an end user managing their device
+    // list (a real self-hosted user saw exactly this: "emscripten · Anki
+    // 26.05" next to their desktop's "macos · Anki 26.05" with no indication
+    // either is a browser/wasm client). Overridden here, once, before
+    // anything that could construct a sync request runs — `sync_client_version`
+    // caches its result in a `LazyLock` on first use, so this must happen
+    // before the first login/sync call, which `wasm_init_backend` (always the
+    // first bridge call) guarantees.
+    //
+    // # Safety
+    // Single-threaded at this point in the bridge's lifecycle (called once,
+    // before any std::thread::spawn'd sync worker could exist) — no
+    // concurrent env access is possible yet.
+    unsafe {
+        std::env::set_var("PLATFORM", "wasm");
+    }
+
     let tr = I18n::new(&["en"]);
     // server = false: we are a client, not a sync server.
     let backend = Backend::new(tr, false);
