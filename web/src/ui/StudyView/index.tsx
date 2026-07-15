@@ -329,7 +329,7 @@ export default function StudyView({
           shrinks toward zero as cards are answered (see `layerCount`), and
           each layer is tinted by the aggregate card-type mix (see
           `distributeLayerTints` — approximate, not per-card lookahead). */}
-      <div className="relative w-full max-w-lg md:max-w-xl lg:max-w-2xl">
+      <div className="relative isolate w-full max-w-lg md:max-w-xl lg:max-w-2xl">
         {showStack &&
           layerTints.map((tint, i) => (
             <div
