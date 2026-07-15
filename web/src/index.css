@@ -1,5 +1,14 @@
 @import 'tailwindcss';
 
+@theme {
+  /* Same typeface the real apps.ankiweb.net uses (Hanken Grotesk) — see
+     main.tsx for the self-hosted @fontsource-variable import. Overrides
+     Tailwind's default sans stack, which Preflight applies to <html>. */
+  --font-sans:
+    'Hanken Grotesk Variable', ui-sans-serif, system-ui, sans-serif, 'Apple Color Emoji',
+    'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
+}
+
 :root {
   color-scheme: light dark;
 }

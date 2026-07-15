@@ -1,6 +1,9 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { registerSW } from 'virtual:pwa-register'
+// Self-hosted variable font — same typeface (Hanken Grotesk) the real
+// apps.ankiweb.net uses, set as the app's sans stack in index.css.
+import '@fontsource-variable/hanken-grotesk'
 import './index.css'
 import App from './App.tsx'
 
