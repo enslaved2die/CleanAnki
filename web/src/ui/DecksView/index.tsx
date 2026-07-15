@@ -57,9 +57,9 @@ function TrashIcon({ className }: { className?: string }) {
 }
 
 /** One New/Learn/Due figure within a deck card. Keeps the same blue/red/green
- * semantic coloring the old table used (real Anki's own convention) — as a
- * lighter (`-200`) shade here since these sit on a saturated gradient card
- * instead of a plain background. */
+ * semantic coloring the old table used (real Anki's own convention) — full
+ * saturation now that this sits in the card's plain white/dark footer rather
+ * than on the gradient itself, where the same colors read as washed out. */
 function DeckStat({
   label,
   value,
@@ -77,7 +77,7 @@ function DeckStat({
         {value}
       </p>
       <p
-        className={`uppercase tracking-wide text-white/70 ${compact ? 'text-[10px]' : 'text-[11px]'}`}
+        className={`uppercase tracking-wide text-neutral-400 dark:text-neutral-500 ${compact ? 'text-[10px]' : 'text-[11px]'}`}
       >
         {label}
       </p>
@@ -124,62 +124,78 @@ function DeckCard({
 
   return (
     <div style={{ marginLeft: `${depth * 1.25}rem` }}>
-      <div
-        className={`bg-gradient-to-br ${gradient} rounded-2xl text-white shadow-md ${compact ? 'p-3' : 'p-4'}`}
-      >
-        <div className="flex items-start gap-1">
-          <button
-            type="button"
-            onClick={() => onStudy(node)}
-            className={`flex-1 truncate text-left font-semibold ${compact ? 'text-sm' : 'text-base'}`}
-            title="Study this deck"
-          >
-            {node.name}
-          </button>
-          <button
-            type="button"
-            onClick={() => onDelete(node.deckId, node.name)}
-            aria-label={`Delete ${node.name}`}
-            title={hasChildren ? 'Delete this deck and all its subdecks' : 'Delete this deck'}
-            className={`flex shrink-0 items-center justify-center rounded-full text-white/80 transition-colors hover:bg-white/15 hover:text-white ${compact ? 'h-6 w-6' : 'h-7 w-7'}`}
-          >
-            <TrashIcon className={compact ? 'h-3.5 w-3.5' : 'h-4 w-4'} />
-          </button>
-        </div>
-
-        <div className={`flex gap-5 ${compact ? 'mt-2' : 'mt-3'}`}>
-          <DeckStat label="New" value={node.newCount} colorClass="text-blue-200" compact={compact} />
-          <DeckStat
-            label="Learn"
-            value={node.learnCount}
-            colorClass="text-red-200"
-            compact={compact}
-          />
-          <DeckStat
-            label="Due"
-            value={node.reviewCount}
-            colorClass="text-green-200"
-            compact={compact}
-          />
-        </div>
-
-        {/* Expand/collapse toggle for subdecks lives at the bottom of the
-            card, not beside the name, so the name itself stays flush left. */}
-        {hasChildren && (
-          <div className="mt-2 flex justify-center">
+      {/* `overflow-hidden` on this wrapper is what clips the gradient header
+          and the plain stats footer below into one rounded card shape,
+          rather than each needing its own rounded corners. */}
+      <div className="overflow-hidden rounded-2xl shadow-md">
+        {/* Gradient band: just the name + delete action. Kept separate from
+            the stats footer below so the New/Learn/Due colors (blue/red/
+            green) sit on a plain white/dark background instead of the
+            saturated gradient, where they'd wash out and be hard to read. */}
+        <div className={`bg-gradient-to-br ${gradient} text-white ${compact ? 'p-3' : 'p-4'}`}>
+          <div className="flex items-start gap-1">
             <button
               type="button"
-              onClick={() => setExpanded((e) => !e)}
-              aria-label={expanded ? 'Collapse subdecks' : 'Expand subdecks'}
-              title={expanded ? 'Collapse subdecks' : 'Expand subdecks'}
-              className="flex h-6 w-12 items-center justify-center rounded-full text-white/70 transition-colors hover:bg-white/15 hover:text-white"
+              onClick={() => onStudy(node)}
+              className={`flex-1 truncate text-left font-semibold ${compact ? 'text-sm' : 'text-base'}`}
+              title="Study this deck"
             >
-              <ChevronDownIcon
-                className={`h-4 w-4 transition-transform ${expanded ? 'rotate-180' : ''}`}
-              />
+              {node.name}
+            </button>
+            <button
+              type="button"
+              onClick={() => onDelete(node.deckId, node.name)}
+              aria-label={`Delete ${node.name}`}
+              title={hasChildren ? 'Delete this deck and all its subdecks' : 'Delete this deck'}
+              className={`flex shrink-0 items-center justify-center rounded-full text-white/80 transition-colors hover:bg-white/15 hover:text-white ${compact ? 'h-6 w-6' : 'h-7 w-7'}`}
+            >
+              <TrashIcon className={compact ? 'h-3.5 w-3.5' : 'h-4 w-4'} />
             </button>
           </div>
-        )}
+        </div>
+
+        <div
+          className={`bg-white dark:bg-neutral-900 ${compact ? 'p-3 pt-2.5' : 'p-4 pt-3'}`}
+        >
+          <div className="flex gap-5">
+            <DeckStat
+              label="New"
+              value={node.newCount}
+              colorClass="text-blue-600 dark:text-blue-400"
+              compact={compact}
+            />
+            <DeckStat
+              label="Learn"
+              value={node.learnCount}
+              colorClass="text-red-600 dark:text-red-400"
+              compact={compact}
+            />
+            <DeckStat
+              label="Due"
+              value={node.reviewCount}
+              colorClass="text-green-600 dark:text-green-400"
+              compact={compact}
+            />
+          </div>
+
+          {/* Expand/collapse toggle for subdecks lives at the bottom of the
+              card, not beside the name, so the name itself stays flush left. */}
+          {hasChildren && (
+            <div className="mt-2 flex justify-center">
+              <button
+                type="button"
+                onClick={() => setExpanded((e) => !e)}
+                aria-label={expanded ? 'Collapse subdecks' : 'Expand subdecks'}
+                title={expanded ? 'Collapse subdecks' : 'Expand subdecks'}
+                className="flex h-6 w-12 items-center justify-center rounded-full text-neutral-400 transition-colors hover:bg-neutral-100 hover:text-neutral-700 dark:text-neutral-500 dark:hover:bg-neutral-800 dark:hover:text-neutral-200"
+              >
+                <ChevronDownIcon
+                  className={`h-4 w-4 transition-transform ${expanded ? 'rotate-180' : ''}`}
+                />
+              </button>
+            </div>
+          )}
+        </div>
       </div>
 
       {hasChildren && expanded && (
