@@ -283,7 +283,7 @@ export default function StudyView({
       {/* Back to Home. Always available — Study is no longer a permanent nav
           destination (reached only by tapping a deck), and every answer is
           persisted immediately, so leaving mid-session loses nothing. */}
-      <div className="w-full max-w-lg">
+      <div className="w-full max-w-lg md:max-w-xl lg:max-w-2xl">
         <button
           type="button"
           onClick={onBack}
@@ -306,7 +306,7 @@ export default function StudyView({
         </button>
       </div>
       {/* Progress bar pinned to the top of the study view. */}
-      <div className="w-full max-w-lg">
+      <div className="w-full max-w-lg md:max-w-xl lg:max-w-2xl">
         <div className="h-2.5 w-full overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-800">
           {hasTarget && (
             <motion.div
@@ -329,7 +329,7 @@ export default function StudyView({
           shrinks toward zero as cards are answered (see `layerCount`), and
           each layer is tinted by the aggregate card-type mix (see
           `distributeLayerTints` — approximate, not per-card lookahead). */}
-      <div className="relative w-full max-w-lg">
+      <div className="relative w-full max-w-lg md:max-w-xl lg:max-w-2xl">
         {showStack &&
           layerTints.map((tint, i) => (
             <div
@@ -429,7 +429,7 @@ export default function StudyView({
       )}
 
       {state.status === 'reviewing' && state.revealed && (
-        <div className="flex w-full max-w-lg flex-col items-center gap-3">
+        <div className="flex w-full max-w-lg md:max-w-xl lg:max-w-2xl flex-col items-center gap-3">
           <p className="text-xs text-neutral-400 dark:text-neutral-500">
             Swipe right = Good, swipe left = Again, or tap a button
           </p>

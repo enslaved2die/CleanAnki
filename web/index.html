@@ -4,7 +4,16 @@
     <meta charset="UTF-8" />
     <link rel="icon" href="/favicon.ico" sizes="any" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- viewport-fit=cover is required for iOS Safari to populate the
+         env(safe-area-inset-*) values the bottom nav (App.tsx) relies on —
+         without it they silently resolve to 0px instead of the real home-
+         indicator/notch inset, only visible once actually installed as a
+         standalone PWA (in-tab Safari doesn't need the safe-area insets, so
+         this was easy to miss without testing on a real device). -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <meta name="apple-mobile-web-app-title" content="CleanAnki" />
     <title>CleanAnki</title>
   </head>
   <body>

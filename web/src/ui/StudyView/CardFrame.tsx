@@ -61,14 +61,33 @@ const RESIZE_SCRIPT = `
   }
   window.addEventListener('load', report);
   window.addEventListener('resize', report);
+  // iOS Safari (especially once installed as a standalone PWA) commonly
+  // finishes loading @font-face fonts *after* the load event — the
+  // ResizeObserver below normally catches the resulting reflow, but iOS has
+  // also been seen to suspend/coalesce observer callbacks while a view is
+  // backgrounded, so this is a second, more direct signal for exactly the
+  // one layout shift most likely to be missed.
+  if (typeof document.fonts !== 'undefined' && document.fonts && document.fonts.ready) {
+    document.fonts.ready.then(report).catch(function () {});
+  }
+  // Standalone iOS PWAs suspend timers/rAF while the view is backgrounded
+  // (app-switch, screen lock) and can resume with a stale measurement from
+  // before whatever caused the backgrounding — re-measure on the two events
+  // WebKit actually fires when a bfcache'd/backgrounded view becomes visible
+  // again, not just on the initial load.
+  window.addEventListener('pageshow', report);
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible') report();
+  });
   if (typeof ResizeObserver !== 'undefined') {
     try { new ResizeObserver(report).observe(document.documentElement); } catch (e) {}
   }
   report();
-  // A couple of delayed re-measures catch async media/script layout shifts
-  // even in engines without ResizeObserver behaving as expected here.
+  // A few delayed re-measures catch async media/script layout shifts even in
+  // engines where the observers/events above don't fire as expected.
   setTimeout(report, 100);
   setTimeout(report, 500);
+  setTimeout(report, 1500);
 })();
 `
 
