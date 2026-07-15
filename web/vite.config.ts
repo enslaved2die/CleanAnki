@@ -24,6 +24,14 @@ export default defineConfig({
     tailwindcss(),
     VitePWA({
       registerType: 'autoUpdate',
+      // The default injected script is a bare `navigator.serviceWorker.
+      // register()` with no update-checking or reload-on-update logic at
+      // all — none of what `registerType: 'autoUpdate'` actually promises
+      // (detecting a new worker and reloading to use it) lives there; that
+      // logic only exists in the `virtual:pwa-register` module. Registering
+      // explicitly via that module in src/main.tsx instead — see the comment
+      // there for the periodic update-check this also adds.
+      injectRegister: false,
       // Phase 1: basic precache-and-serve-offline for built assets. This is
       // deliberately not tuned for the .wasm/.data artifacts that will show
       // up once rust/wasm-bridge/ produces real build output — revisit the
