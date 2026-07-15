@@ -1012,6 +1012,161 @@ pub unsafe extern "C" fn wasm_write_media_file(
     }
 }
 
+/// Scans the media folder for unused/missing files, exactly like real Anki
+/// desktop's Tools → Check Media. This is `Collection::media_checker()` +
+/// `MediaChecker::check()` from rslib (`rslib/src/media/check.rs`) — the same
+/// underlying scan the desktop dialog runs. It's a purely local disk-scan
+/// operation (no network), so it uses the simple synchronous lock/guard
+/// pattern (like `wasm_get_stats`), not the thread-spawn+poll sync pattern.
+///
+/// Note: `check()` has a real side effect — it renames non-normalized
+/// filenames on disk (NFC normalization + illegal-character fixups) as part of
+/// the scan, identical to desktop's Check Media. That's expected behaviour,
+/// not a bug.
+///
+/// The report text (`summary`) is produced by rslib's own
+/// `MediaChecker::summarize_output`, so it matches the desktop dialog's
+/// translated headline counts + sections verbatim rather than being
+/// hand-rolled here.
+///
+/// Result JSON (written via `wasm_last_result_ptr/len`):
+/// ```json
+/// {
+///   "summary": "…multi-line human-readable report…",
+///   "unusedCount": 3,
+///   "missingCount": 0,
+///   "trashCount": 0,
+///   "trashBytes": 0
+/// }
+/// ```
+/// Returns 0 on success, negative on error (see `wasm_last_error_*`).
+#[no_mangle]
+pub extern "C" fn wasm_check_media() -> i32 {
+    let mut guard = match collection_slot().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            set_last_error("internal lock poisoned");
+            return -2;
+        }
+    };
+    let col = match guard.as_mut() {
+        Some(c) => c,
+        None => {
+            set_last_error("no collection open; call wasm_open_collection first");
+            return -1;
+        }
+    };
+
+    // A single `MediaChecker` instance handles both steps: `check()` takes
+    // `&mut self` and `summarize_output()` takes `&self`, so there's no need to
+    // build a second checker (and no re-scan). `summarize_output` mutates
+    // `output` in place (it sorts the section lists), hence `&mut output`.
+    let mut checker = match col.media_checker() {
+        Ok(c) => c,
+        Err(e) => {
+            set_last_error(e);
+            return -3;
+        }
+    };
+    let mut output = match checker.check() {
+        Ok(o) => o,
+        Err(e) => {
+            set_last_error(e);
+            return -4;
+        }
+    };
+    let summary = checker.summarize_output(&mut output);
+
+    let payload = serde_json::json!({
+        "summary": summary,
+        "unusedCount": output.unused.len(),
+        "missingCount": output.missing.len(),
+        "trashCount": output.trash_count,
+        "trashBytes": output.trash_bytes,
+    });
+
+    match serde_json::to_vec(&payload) {
+        Ok(bytes) => {
+            set_last_result(bytes);
+            0
+        }
+        Err(e) => {
+            set_last_error(e);
+            -5
+        }
+    }
+}
+
+/// Deletes every currently-unused (unreferenced) media file, the explicit
+/// second step of real Anki desktop's Check Media flow. Re-runs a fresh scan
+/// (`media_checker()`/`check()`) to get the current unused list, then
+/// `MediaManager::remove_files()` (`rslib/src/media/mod.rs`), which both
+/// physically deletes the files from the media folder AND marks their DB
+/// entries `sha1: None, sync_required: true` — that's what makes the deletion
+/// propagate to the server on the next media sync.
+///
+/// Returns the deleted filenames as a JSON array of strings (via
+/// `wasm_last_result_ptr/len`), e.g. `["old.jpg","stale.mp3"]`. The JS side
+/// needs the actual names (not just a count) so it can also remove them from
+/// OPFS. Returns 0 on success, negative on error (see `wasm_last_error_*`).
+#[no_mangle]
+pub extern "C" fn wasm_delete_unused_media() -> i32 {
+    let mut guard = match collection_slot().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            set_last_error("internal lock poisoned");
+            return -2;
+        }
+    };
+    let col = match guard.as_mut() {
+        Some(c) => c,
+        None => {
+            set_last_error("no collection open; call wasm_open_collection first");
+            return -1;
+        }
+    };
+
+    let output = {
+        let mut checker = match col.media_checker() {
+            Ok(c) => c,
+            Err(e) => {
+                set_last_error(e);
+                return -3;
+            }
+        };
+        match checker.check() {
+            Ok(o) => o,
+            Err(e) => {
+                set_last_error(e);
+                return -4;
+            }
+        }
+    };
+
+    let mgr = match col.media() {
+        Ok(m) => m,
+        Err(e) => {
+            set_last_error(e);
+            return -5;
+        }
+    };
+    if let Err(e) = mgr.remove_files(&output.unused) {
+        set_last_error(e);
+        return -6;
+    }
+
+    match serde_json::to_vec(&output.unused) {
+        Ok(bytes) => {
+            set_last_result(bytes);
+            0
+        }
+        Err(e) => {
+            set_last_error(e);
+            -7
+        }
+    }
+}
+
 /// Fetch the next due card. Returns its numeric card id (>= 0), or `-1` if the
 /// queue is empty, or `-2` on error (see `wasm_last_error_*`).
 ///

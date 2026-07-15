@@ -170,3 +170,19 @@ export async function listOpfsMediaFiles(): Promise<string[]> {
   }
   return names
 }
+
+/** Deletes a single media file from OPFS `media/`. No-op if the file (or the
+ * media directory itself) doesn't exist — mirrors `deleteOpfsFile`, but scoped
+ * to the media subdirectory. */
+export async function deleteOpfsMediaFile(name: string): Promise<void> {
+  const dir = await getMediaDir(false)
+  if (!dir) return
+  try {
+    await dir.removeEntry(name)
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'NotFoundError') {
+      return
+    }
+    throw err
+  }
+}

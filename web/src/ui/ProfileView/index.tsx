@@ -8,9 +8,11 @@ import {
   syncMedia,
   getStats,
   resetProgress,
+  checkMedia,
   FullSyncRequiredError,
   type SyncProgress,
   type Stats,
+  type MediaCheckReport,
 } from '../../wasm/backend'
 import {
   ensureCollectionReady,
@@ -18,6 +20,7 @@ import {
   persistMedia,
   persistMediaDb,
   restoreMediaToBackend,
+  checkAndDeleteUnusedMedia,
 } from '../../db/collection'
 import DonutChart from '../charts/DonutChart'
 import ForecastBarChart from '../charts/ForecastBarChart'
@@ -225,6 +228,12 @@ export default function ProfileView({
   const [resetStatus, setResetStatus] = useState<'idle' | 'resetting'>('idle')
   const statsBootstrapped = useRef(false)
 
+  // Check Media (Tools → Check Media in real Anki): a two-step maintenance
+  // action — scan+report first, then an explicit delete of the unused files.
+  const [mediaCheckStatus, setMediaCheckStatus] = useState<'idle' | 'checking' | 'deleting'>('idle')
+  const [mediaCheckReport, setMediaCheckReport] = useState<MediaCheckReport | null>(null)
+  const [mediaCheckError, setMediaCheckError] = useState<string | null>(null)
+
   // Notify the parent of the current auth state, including once on mount.
   useEffect(() => {
     onAuthChange?.(hkey)
@@ -425,6 +434,51 @@ export default function ProfileView({
       setResetStatus('idle')
     }
   }, [refreshStats])
+
+  const handleCheckMedia = useCallback(async () => {
+    setMediaCheckError(null)
+    setMediaCheckStatus('checking')
+    try {
+      // The scan reads the media folder in the backend's in-memory FS, which
+      // is wiped on reload and NOT eagerly repopulated (see
+      // restoreMediaToBackend's doc comment). Restore first so the scan sees
+      // the real persisted library, not an empty folder — otherwise it would
+      // report 0 unused files on any post-reload check.
+      await restoreMediaToBackend()
+      const report = await checkMedia()
+      setMediaCheckReport(report)
+      setMediaCheckStatus('idle')
+    } catch (err) {
+      setMediaCheckError(errorMessage(err))
+      setMediaCheckStatus('idle')
+    }
+  }, [])
+
+  const handleDeleteUnusedMedia = useCallback(async () => {
+    const count = mediaCheckReport?.unusedCount ?? 0
+    if (count === 0) return
+    // Destructive: matches the confirm-before-destroying pattern of
+    // full-download/upload and reset-progress above.
+    const ok = window.confirm(
+      `Delete ${count} unused media file${count === 1 ? '' : 's'}? ` +
+        'They are referenced by no note and will be removed from this browser and, ' +
+        'on your next media sync, from the server too. This cannot be undone.',
+    )
+    if (!ok) return
+
+    setMediaCheckStatus('deleting')
+    try {
+      await checkAndDeleteUnusedMedia()
+      // Re-run the scan so the displayed report refreshes (should now show 0
+      // unused).
+      const report = await checkMedia()
+      setMediaCheckReport(report)
+      setMediaCheckStatus('idle')
+    } catch (err) {
+      setMediaCheckError(errorMessage(err))
+      setMediaCheckStatus('idle')
+    }
+  }, [mediaCheckReport])
 
   const primaryButton =
     'w-full rounded-2xl bg-indigo-600 px-4 py-2.5 font-medium text-white transition-colors hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed dark:bg-indigo-500 dark:hover:bg-indigo-400'
@@ -750,6 +804,58 @@ export default function ProfileView({
                     Every card goes back to "new" and all review history is deleted. Decks, notes, and
                     cards are kept.
                   </p>
+                </div>
+
+                <div className="border-t border-neutral-200 pt-6 dark:border-neutral-800">
+                  <h3 className="text-xs font-medium uppercase tracking-wide text-neutral-400 dark:text-neutral-500">
+                    Check media
+                  </h3>
+                  <p className="mt-1.5 text-xs text-neutral-500 dark:text-neutral-400">
+                    Scans for media files (audio/images) that no note references anymore — for
+                    example after deleting a deck. Deleting a deck never removes its media
+                    automatically (files can be shared between notes), just like Anki desktop; this
+                    is how you clean them up.
+                  </p>
+                  <div className="mt-3">
+                    <button
+                      type="button"
+                      onClick={handleCheckMedia}
+                      disabled={mediaCheckStatus !== 'idle'}
+                      className="rounded-lg bg-neutral-100 px-4 py-2 text-sm font-medium text-neutral-700 transition-colors hover:bg-neutral-200 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-neutral-800 dark:text-neutral-200 dark:hover:bg-neutral-700"
+                    >
+                      {mediaCheckStatus === 'checking' ? 'Checking…' : 'Check media'}
+                    </button>
+                  </div>
+
+                  {mediaCheckError && (
+                    <div className="mt-3 rounded-lg bg-red-50 p-3 text-sm text-red-700 dark:bg-red-950/50 dark:text-red-300">
+                      {mediaCheckError}
+                    </div>
+                  )}
+
+                  {mediaCheckReport && (
+                    <div className="mt-3 space-y-3">
+                      <p className="text-sm font-medium text-neutral-700 dark:text-neutral-300">
+                        {mediaCheckReport.unusedCount} unused file
+                        {mediaCheckReport.unusedCount === 1 ? '' : 's'} found
+                      </p>
+                      <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded-lg bg-neutral-50 p-3 text-xs text-neutral-600 dark:bg-neutral-900 dark:text-neutral-400">
+                        {mediaCheckReport.summary}
+                      </pre>
+                      {mediaCheckReport.unusedCount > 0 && (
+                        <button
+                          type="button"
+                          onClick={handleDeleteUnusedMedia}
+                          disabled={mediaCheckStatus !== 'idle'}
+                          className="rounded-lg bg-red-50 px-4 py-2 text-sm font-medium text-red-700 transition-colors hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-red-950/50 dark:text-red-300 dark:hover:bg-red-950"
+                        >
+                          {mediaCheckStatus === 'deleting'
+                            ? 'Deleting…'
+                            : `Delete ${mediaCheckReport.unusedCount} unused file${mediaCheckReport.unusedCount === 1 ? '' : 's'}`}
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
               </>
             )}

@@ -136,6 +136,26 @@ export interface Stats {
   dueForecast: { day: number; count: number }[]
 }
 
+/**
+ * Result of a media check — the real rslib `MediaCheckOutput` (from
+ * `Collection::media_checker().check()`), reduced to the fields the UI needs.
+ * `summary` is rslib's own `MediaChecker::summarize_output` text, identical to
+ * what real Anki desktop's Tools → Check Media dialog shows (multi-line).
+ */
+export interface MediaCheckReport {
+  /** Full human-readable report text (multi-line), produced by rslib. */
+  summary: string
+  /** Number of media files referenced by no note — the ones deletable via
+   * `deleteUnusedMedia`. */
+  unusedCount: number
+  /** Number of files referenced by notes but missing from the media folder. */
+  missingCount: number
+  /** Number of files sitting in the media trash folder. */
+  trashCount: number
+  /** Total size in bytes of the files in the media trash folder. */
+  trashBytes: number
+}
+
 /** Raw shape of the object Emscripten's MODULARIZE factory resolves to.
  * Only the pieces this module actually touches are declared. */
 interface EmscriptenModule {
@@ -166,6 +186,8 @@ interface EmscriptenModule {
   _wasm_set_current_deck(deckId: bigint): number
   _wasm_delete_deck(deckId: bigint): number
   _wasm_list_media_files(): number
+  _wasm_check_media(): number
+  _wasm_delete_unused_media(): number
   _wasm_read_media_file(ptr: number, len: number): number
   _wasm_write_media_file(
     namePtr: number,
@@ -574,6 +596,44 @@ export async function listMediaFiles(): Promise<string[]> {
   const rc = mod._wasm_list_media_files()
   if (rc !== 0) {
     throw new Error(`wasm_list_media_files failed (${rc}): ${readLastError(mod)}`)
+  }
+  return JSON.parse(readLastResult(mod)) as string[]
+}
+
+/**
+ * Scans for unused/missing media files, exactly like real Anki desktop's
+ * Tools → Check Media (this is rslib's `Collection::media_checker().check()`).
+ * Purely a local disk scan — no network. Returns the report the desktop dialog
+ * would show plus the headline counts.
+ *
+ * Real side effect (same as desktop): the scan renames any non-NFC-normalized
+ * or illegally-named files on disk as it goes. That's rslib behaviour, not a
+ * bug — callers should `persistMediaDb`/persist media after if they care about
+ * those renames surviving a reload.
+ */
+export async function checkMedia(): Promise<MediaCheckReport> {
+  const mod = await loadModule()
+  const rc = mod._wasm_check_media()
+  if (rc !== 0) {
+    throw new Error(`wasm_check_media failed (${rc}): ${readLastError(mod)}`)
+  }
+  return JSON.parse(readLastResult(mod)) as MediaCheckReport
+}
+
+/**
+ * Deletes every currently-unused (unreferenced) media file — the explicit
+ * second step of Check Media. This is rslib's `MediaManager::remove_files`,
+ * which both physically deletes the files AND marks their media-DB entries
+ * `sha1: None, sync_required: true`, so the deletion propagates to the server
+ * on the next media sync. Returns the deleted filenames so the caller can also
+ * remove them from OPFS (see `checkAndDeleteUnusedMedia` in db/collection.ts,
+ * which ties OPFS + media-DB persistence together).
+ */
+export async function deleteUnusedMedia(): Promise<string[]> {
+  const mod = await loadModule()
+  const rc = mod._wasm_delete_unused_media()
+  if (rc !== 0) {
+    throw new Error(`wasm_delete_unused_media failed (${rc}): ${readLastError(mod)}`)
   }
   return JSON.parse(readLastResult(mod)) as string[]
 }

@@ -11,6 +11,7 @@ import {
   writeOpfsMediaFile,
   readOpfsMediaFile,
   listOpfsMediaFiles,
+  deleteOpfsMediaFile,
 } from './opfs'
 import {
   initBackend,
@@ -21,6 +22,7 @@ import {
   writeMediaFile,
   readMediaDbBytes,
   writeMediaDbBytes,
+  deleteUnusedMedia,
 } from '../wasm/backend'
 
 /** Filename the collection is persisted under at the root of OPFS. */
@@ -141,6 +143,34 @@ export async function restoreMediaDbToBackend(): Promise<void> {
     const bytes = await readOpfsFile(MEDIA_DB_OPFS_FILENAME)
     await writeMediaDbBytes(bytes)
   }
+}
+
+/**
+ * Deletes every unused (unreferenced) media file — the explicit second step of
+ * Check Media — and keeps all three places media state lives consistent:
+ *
+ *  1. `deleteUnusedMedia()` (wasm) physically removes the files from the
+ *     backend's media folder AND marks their media-DB entries
+ *     `sha1: None, sync_required: true`.
+ *  2. `deleteOpfsMediaFile()` removes each deleted file from OPFS, so the
+ *     browser-side persistent copy doesn't linger (the card renderer reads
+ *     media straight from OPFS — see web/src/wasm/media.ts).
+ *  3. `persistMediaDb()` writes the updated media-DB (with those
+ *     `sync_required` marks) back to OPFS. This is the load-bearing step:
+ *     without it the marks are lost on reload and the deletion never
+ *     propagates to the server on the next media sync — the same
+ *     OPFS/media-DB consistency issue `persistMedia`/`persistMediaDb` were
+ *     added to fix for media sync (see their doc comments above).
+ *
+ * Returns the number of files deleted.
+ */
+export async function checkAndDeleteUnusedMedia(): Promise<number> {
+  const deletedNames = await deleteUnusedMedia()
+  for (const name of deletedNames) {
+    await deleteOpfsMediaFile(name)
+  }
+  await persistMediaDb()
+  return deletedNames.length
 }
 
 // Shared bootstrap so any view (StudyView, the import/deck-picker UI) can

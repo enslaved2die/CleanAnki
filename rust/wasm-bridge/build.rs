@@ -70,6 +70,8 @@ fn main() {
         "_wasm_list_media_files",
         "_wasm_read_media_file",
         "_wasm_write_media_file",
+        "_wasm_check_media",
+        "_wasm_delete_unused_media",
         "_wasm_get_next_card",
         "_wasm_render_current_card",
         "_wasm_answer_card",
