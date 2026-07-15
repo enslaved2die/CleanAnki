@@ -181,7 +181,7 @@ function DeckCard({
           {/* Expand/collapse toggle for subdecks lives at the bottom of the
               card, not beside the name, so the name itself stays flush left. */}
           {hasChildren && (
-            <div className="mt-2 flex justify-center">
+            <div className="mt-2 flex justify-start">
               <button
                 type="button"
                 onClick={() => setExpanded((e) => !e)}
