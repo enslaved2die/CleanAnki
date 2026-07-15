@@ -57,6 +57,7 @@ fn main() {
         "_wasm_last_result_ptr",
         "_wasm_last_result_len",
         "_wasm_init_backend",
+        "_wasm_anki_version",
         "_wasm_open_collection",
         "_wasm_checkpoint",
         "_wasm_checkpoint_media_db",

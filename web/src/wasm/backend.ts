@@ -217,6 +217,7 @@ interface EmscriptenModule {
   _wasm_last_result_ptr(): number
   _wasm_last_result_len(): number
   _wasm_init_backend(): number
+  _wasm_anki_version(): number
   _wasm_open_collection(ptr: number, len: number): number
   _wasm_checkpoint(): number
   _wasm_checkpoint_media_db(): number
@@ -406,6 +407,25 @@ export async function initBackend(): Promise<void> {
   })()
 
   return backendInitPromise
+}
+
+/** The real vendored rslib version this build is running — the same
+ * version/buildhash pair embedded in every sync request's client_version
+ * string (see rust/wasm-bridge/src/main.rs's `wasm_init_backend` doc
+ * comment), surfaced directly for display. Doesn't need a collection open —
+ * these are plain functions on the `anki` crate, not `Collection` methods. */
+export interface AnkiVersion {
+  version: string
+  buildhash: string
+}
+
+export async function getAnkiVersion(): Promise<AnkiVersion> {
+  const mod = await loadModule()
+  const rc = mod._wasm_anki_version()
+  if (rc !== 0) {
+    throw new Error(`wasm_anki_version failed (${rc}): ${readLastError(mod)}`)
+  }
+  return JSON.parse(readLastResult(mod)) as AnkiVersion
 }
 
 // Like `backendInitPromise` above: the backend keeps one collection open for

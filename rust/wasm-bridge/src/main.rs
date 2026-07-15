@@ -259,6 +259,34 @@ pub extern "C" fn wasm_init_backend() -> i32 {
     }
 }
 
+/// Returns the real version of the vendored `rslib` this bridge is built
+/// against — `anki::version::version()` (reads `rust/vendor/anki/.version`,
+/// the exact pinned tag, e.g. "26.05") and `anki::version::buildhash()`
+/// (`option_env!("BUILDHASH")`, "dev" for a local build with no CI-injected
+/// hash). The same two values that make up every sync request's
+/// `client_version` string elsewhere in this file — surfaced directly here
+/// so the UI can show "which real Anki version is this" without needing a
+/// collection open first (no collection lock needed at all: these are plain
+/// functions, not `Collection` methods). Used by the Profile page's version
+/// footer.
+#[no_mangle]
+pub extern "C" fn wasm_anki_version() -> i32 {
+    let payload = serde_json::json!({
+        "version": anki::version::version(),
+        "buildhash": anki::version::buildhash(),
+    });
+    match serde_json::to_vec(&payload) {
+        Ok(bytes) => {
+            set_last_result(bytes);
+            0
+        }
+        Err(e) => {
+            set_last_error(e);
+            -1
+        }
+    }
+}
+
 /// Open a collection from raw `.anki2`/`.anki21` (SQLite) bytes at
 /// `ptr`/`len` (as written by JS after a `wasm_alloc` call).
 /// Returns 0 on success, negative on error (see `wasm_last_error_*`).

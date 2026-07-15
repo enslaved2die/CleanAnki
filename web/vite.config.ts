@@ -1,7 +1,27 @@
+import { execSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { VitePWA } from 'vite-plugin-pwa'
+
+// Build-time constants for the Profile page's version footer (see
+// src/vite-env.d.ts for the ambient declarations `__APP_VERSION__`/
+// `__GIT_COMMIT__` consumers import against). package.json's version is the
+// human-readable one; the git commit is the precise "which exact build is
+// this" identifier that stays accurate between version bumps (this project
+// doesn't bump package.json on every commit).
+const pkg = JSON.parse(
+  readFileSync(fileURLToPath(new URL('./package.json', import.meta.url)), 'utf-8'),
+) as { version: string }
+let gitCommit = 'unknown'
+try {
+  gitCommit = execSync('git rev-parse --short HEAD').toString().trim()
+} catch {
+  // Not a git checkout (e.g. a source tarball) — fall back silently, this is
+  // just a display nicety, not load-bearing for anything.
+}
 
 // COOP/COEP are required for cross-origin isolation, which is required to use
 // SharedArrayBuffer, which is required by the Emscripten-compiled Rust core
@@ -19,6 +39,10 @@ const crossOriginIsolationHeaders = {
 
 // https://vite.dev/config/
 export default defineConfig({
+  define: {
+    __APP_VERSION__: JSON.stringify(pkg.version),
+    __GIT_COMMIT__: JSON.stringify(gitCommit),
+  },
   plugins: [
     react(),
     tailwindcss(),

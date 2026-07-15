@@ -9,10 +9,12 @@ import {
   getStats,
   resetProgress,
   checkMedia,
+  getAnkiVersion,
   FullSyncRequiredError,
   type SyncProgress,
   type Stats,
   type MediaCheckReport,
+  type AnkiVersion,
 } from '../../wasm/backend'
 import {
   ensureCollectionReady,
@@ -234,10 +236,24 @@ export default function ProfileView({
   const [mediaCheckReport, setMediaCheckReport] = useState<MediaCheckReport | null>(null)
   const [mediaCheckError, setMediaCheckError] = useState<string | null>(null)
 
+  // Real rslib version this build's wasm bridge was compiled against (see
+  // `wasm_anki_version` in rust/wasm-bridge/src/main.rs) — a plain function
+  // call, no collection lock needed, so it's fetched independently of the
+  // stats bootstrap above. Purely informational for the version footer
+  // below; a failure here just leaves it blank rather than surfacing an
+  // error to the user.
+  const [ankiVersion, setAnkiVersion] = useState<AnkiVersion | null>(null)
+
   // Notify the parent of the current auth state, including once on mount.
   useEffect(() => {
     onAuthChange?.(hkey)
   }, [hkey, onAuthChange])
+
+  useEffect(() => {
+    getAnkiVersion()
+      .then(setAnkiVersion)
+      .catch(() => {})
+  }, [])
 
   const refreshStats = useCallback(async () => {
     const s = await getStats()
@@ -863,6 +879,11 @@ export default function ProfileView({
               </>
             )}
           </section>
+
+      <p className="text-center text-xs text-neutral-400 dark:text-neutral-600">
+        CleanAnki v{__APP_VERSION__} ({__GIT_COMMIT__})
+        {ankiVersion && ` · Anki ${ankiVersion.version}`}
+      </p>
     </motion.div>
   )
 }
