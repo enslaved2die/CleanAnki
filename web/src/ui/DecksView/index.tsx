@@ -10,6 +10,7 @@ import {
 import { ensureCollectionReady, persistCollection } from '../../db/collection'
 import ImportView from '../ImportView'
 import type { StudyQueueInfo } from '../../App'
+import { gradientForDeck } from '../deckGradients'
 
 type Status = 'loading' | 'ready' | 'error'
 
@@ -17,14 +18,58 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
 }
 
+function ChevronIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.8}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden
+    >
+      <path d="m9 6 6 6-6 6" />
+    </svg>
+  )
+}
+
+function TrashIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.8}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden
+    >
+      <path d="M4 7h16" />
+      <path d="M6 7v12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V7" />
+      <path d="M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2" />
+      <path d="M10 11v6" />
+      <path d="M14 11v6" />
+    </svg>
+  )
+}
+
 /**
- * One deck row (recursing into its children). Uses the real nested tree +
+ * One deck card (recursing into its children). Uses the real nested tree +
  * due counts from `wasm_get_deck_tree` (rslib's own `Collection::deck_tree`)
  * rather than re-deriving a hierarchy from flat `::`-joined names — rslib
  * already builds the tree and computes New/Learn/Due for us, matching the
  * counts real Anki's own deck-overview screen shows.
+ *
+ * Styled like HomeView's deck cards (same gradient palette, keyed by the same
+ * deck id — see `gradientForDeck`) rather than a plain table row, just bigger
+ * and with the New/Learn/Due breakdown inline instead of one aggregate
+ * number. All actions (expand/collapse, delete) are icon-only, matching the
+ * rest of the app's nav/back-button convention.
  */
-function DeckRow({
+function DeckCard({
   node,
   depth,
   onStudy,
@@ -37,67 +82,76 @@ function DeckRow({
 }) {
   const [expanded, setExpanded] = useState(true)
   const hasChildren = node.children.length > 0
+  const gradient = gradientForDeck(node.deckId)
 
   return (
-    <>
-      <tr className="border-b border-neutral-100 last:border-0 dark:border-neutral-800">
-        <td className="py-1.5 pr-2">
-          <div className="flex items-center gap-1" style={{ paddingLeft: `${depth * 1.25}rem` }}>
-            {hasChildren ? (
-              <button
-                type="button"
-                onClick={() => setExpanded((e) => !e)}
-                aria-label={expanded ? 'Collapse' : 'Expand'}
-                className="w-4 shrink-0 text-xs text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200"
-              >
-                {expanded ? '▾' : '▸'}
-              </button>
-            ) : (
-              <span className="w-4 shrink-0" />
-            )}
+    <div style={{ marginLeft: `${depth * 1.25}rem` }}>
+      <div className={`bg-gradient-to-br ${gradient} rounded-2xl p-4 text-white shadow-md`}>
+        <div className="flex items-center gap-1">
+          {hasChildren ? (
             <button
               type="button"
-              onClick={() => onStudy(node)}
-              className="truncate text-left text-sm hover:underline"
-              title="Study this deck"
+              onClick={() => setExpanded((e) => !e)}
+              aria-label={expanded ? 'Collapse' : 'Expand'}
+              title={expanded ? 'Collapse' : 'Expand'}
+              className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-white/80 transition-colors hover:bg-white/15 hover:text-white"
             >
-              {node.name}
+              <ChevronIcon
+                className={`h-4 w-4 transition-transform ${expanded ? 'rotate-90' : ''}`}
+              />
             </button>
-          </div>
-        </td>
-        <td className="px-2 py-1.5 text-right text-sm tabular-nums text-blue-600 dark:text-blue-400">
-          {node.newCount}
-        </td>
-        <td className="px-2 py-1.5 text-right text-sm tabular-nums text-red-600 dark:text-red-400">
-          {node.learnCount}
-        </td>
-        <td className="px-2 py-1.5 text-right text-sm tabular-nums text-green-600 dark:text-green-400">
-          {node.reviewCount}
-        </td>
-        <td className="py-1.5 pl-2 text-right">
+          ) : (
+            <span className="w-7 shrink-0" />
+          )}
+          <button
+            type="button"
+            onClick={() => onStudy(node)}
+            className="flex-1 truncate text-left text-base font-semibold"
+            title="Study this deck"
+          >
+            {node.name}
+          </button>
           <button
             type="button"
             onClick={() => onDelete(node.deckId, node.name)}
             aria-label={`Delete ${node.name}`}
             title={hasChildren ? 'Delete this deck and all its subdecks' : 'Delete this deck'}
-            className="rounded-lg px-2 py-1 text-xs text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-950/50"
+            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-white/80 transition-colors hover:bg-white/15 hover:text-white"
           >
-            Delete
+            <TrashIcon className="h-4 w-4" />
           </button>
-        </td>
-      </tr>
-      {hasChildren &&
-        expanded &&
-        node.children.map((child) => (
-          <DeckRow
-            key={child.deckId.toString()}
-            node={child}
-            depth={depth + 1}
-            onStudy={onStudy}
-            onDelete={onDelete}
-          />
-        ))}
-    </>
+        </div>
+
+        <div className="mt-3 flex gap-5">
+          <div>
+            <p className="text-lg font-bold tabular-nums">{node.newCount}</p>
+            <p className="text-[11px] uppercase tracking-wide text-white/70">New</p>
+          </div>
+          <div>
+            <p className="text-lg font-bold tabular-nums">{node.learnCount}</p>
+            <p className="text-[11px] uppercase tracking-wide text-white/70">Learn</p>
+          </div>
+          <div>
+            <p className="text-lg font-bold tabular-nums">{node.reviewCount}</p>
+            <p className="text-[11px] uppercase tracking-wide text-white/70">Due</p>
+          </div>
+        </div>
+      </div>
+
+      {hasChildren && expanded && (
+        <div className="mt-3 space-y-3">
+          {node.children.map((child) => (
+            <DeckCard
+              key={child.deckId.toString()}
+              node={child}
+              depth={depth + 1}
+              onStudy={onStudy}
+              onDelete={onDelete}
+            />
+          ))}
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -311,29 +365,16 @@ export default function DecksView({
       )}
 
       {status === 'ready' && tree && tree.children.length > 0 && (
-        <div className="overflow-x-auto rounded-2xl border border-neutral-200 p-2 shadow-sm dark:border-neutral-800">
-          <table className="w-full border-collapse">
-            <thead>
-              <tr className="border-b border-neutral-200 text-xs font-medium uppercase tracking-wide text-neutral-400 dark:border-neutral-800 dark:text-neutral-500">
-                <th className="py-1.5 pr-2 text-left font-medium">Deck</th>
-                <th className="px-2 py-1.5 text-right font-medium">New</th>
-                <th className="px-2 py-1.5 text-right font-medium">Learn</th>
-                <th className="px-2 py-1.5 text-right font-medium">Due</th>
-                <th className="py-1.5 pl-2" />
-              </tr>
-            </thead>
-            <tbody>
-              {tree.children.map((node) => (
-                <DeckRow
-                  key={node.deckId.toString()}
-                  node={node}
-                  depth={0}
-                  onStudy={handleStudy}
-                  onDelete={handleDelete}
-                />
-              ))}
-            </tbody>
-          </table>
+        <div className="space-y-3">
+          {tree.children.map((node) => (
+            <DeckCard
+              key={node.deckId.toString()}
+              node={node}
+              depth={0}
+              onStudy={handleStudy}
+              onDelete={handleDelete}
+            />
+          ))}
         </div>
       )}
 
